@@ -13,6 +13,9 @@
 	"importPaths": [
 		"source"
 	],
+	"dependencies": {
+		"vibe-core": "~>2.0"
+	},
 	"preBuildCommands": [
 		"bash $PACKAGE_DIR/vendor/build-libudx.sh"
 	],

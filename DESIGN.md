@@ -93,7 +93,9 @@ Isolated local DHT for unit tests: bootstrap `[]`.
   - [x] amalgamation: libudx built as ONE C++ TU in `namespace udx` — ALL symbols
         (internals + public API) enclosed under `udx::`, zero global `udx_*`/`uv_*`;
         C++↔D link proven (link test); D calls the API via extern(C++, "udx")
-  - [ ] loop + timer + buf (impl + test: a timer fires on the vibe loop)
+  - [x] loop + timer + buf: `Loop` runner on vibe (fire due timers → sleep to next
+        deadline/wake → repeat); hsuv_timer_*/now/hrtime/buf_init/close/is_active live;
+        tests: one-shot fires once after timeout, repeating re-arms until stopped
   - [ ] UDP on vibe UDPConnection
   - [ ] prepare/check + close
   - [ ] getaddrinfo + interfaces + strerror
