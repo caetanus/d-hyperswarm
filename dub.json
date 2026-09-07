@@ -1,0 +1,43 @@
+{
+	"name": "hyperswarm",
+	"description": "Holepunch hyperswarm in D — wire-compatible with the real network, fibers on vibe-core, crypto on libsodium",
+	"authors": [
+		"caetano"
+	],
+	"license": "MIT",
+	"targetType": "library",
+	"targetPath": "bin",
+	"sourcePaths": [
+		"source"
+	],
+	"importPaths": [
+		"source"
+	],
+	"configurations": [
+		{
+			"name": "library",
+			"targetType": "library"
+		},
+		{
+			"name": "ut",
+			"targetType": "executable",
+			"targetName": "hyperswarm-test",
+			"mainSourceFile": "tests/runner.d",
+			"sourcePaths": [
+				"source",
+				"tests"
+			],
+			"importPaths": [
+				"source",
+				"tests"
+			],
+			"dependencies": {
+				"unit-threaded": "~>2.2",
+				"fluent-asserts": "~>2.0"
+			},
+			"dflags": [
+				"-unittest"
+			]
+		}
+	]
+}

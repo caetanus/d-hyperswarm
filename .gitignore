@@ -1,0 +1,6 @@
+bin/
+.dub/
+*.o
+*.a
+dub.selections.json
+tests/vectors/node_modules/
