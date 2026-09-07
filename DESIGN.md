@@ -85,8 +85,15 @@ Isolated local DHT for unit tests: bootstrap `[]`.
 
 ## Status
 
-- [x] Phase 1: compact-encoding port + byte-exact vectors — **in progress**
-- [ ] Phase 2: libudx vendored binding
+- [x] Phase 1: compact-encoding port + byte-exact vectors (16 tests, 0 failed)
+- [ ] Phase 2: UDX via the libuv→vibe facade (decided facade over laundering, 2026-09-07)
+  - [x] libudx vendored (`vendor/libudx`, pin 01d6630)
+  - [x] header milestone: shim `uv.h` (`vendor/libudx-shim`), all 9 src/*.c compile against it
+  - [ ] loop + timer + buf (impl + test: a timer fires on the vibe loop)
+  - [ ] UDP on vibe UDPConnection
+  - [ ] prepare/check + close
+  - [ ] getaddrinfo + interfaces + strerror
+  - [ ] udx echo D↔D, then acceptance D↔JS
 - [ ] Phase 3: secret-stream
 - [ ] Phase 4: dht-rpc
 - [ ] Phase 5: hyperdht (+ holepunch)
