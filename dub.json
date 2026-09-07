@@ -13,6 +13,15 @@
 	"importPaths": [
 		"source"
 	],
+	"preBuildCommands": [
+		"bash $PACKAGE_DIR/vendor/build-libudx.sh"
+	],
+	"lflags": [
+		"bin/libhsudx.a"
+	],
+	"libs": [
+		"m"
+	],
 	"configurations": [
 		{
 			"name": "library",

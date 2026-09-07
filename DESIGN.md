@@ -89,6 +89,9 @@ Isolated local DHT for unit tests: bootstrap `[]`.
 - [ ] Phase 2: UDX via the libuv→vibe facade (decided facade over laundering, 2026-09-07)
   - [x] libudx vendored (`vendor/libudx`, pin 01d6630)
   - [x] header milestone: shim `uv.h` (`vendor/libudx-shim`), all 9 src/*.c compile against it
+  - [x] uv symbol isolation: facade renamed to `hsuv_*` (no global `uv_*`)
+  - [x] amalgamation: libudx built as ONE C++ TU in `namespace udx` (internals under
+        `udx::`, public API stays `extern "C"` per udx.h); C↔D link proven (link test)
   - [ ] loop + timer + buf (impl + test: a timer fires on the vibe loop)
   - [ ] UDP on vibe UDPConnection
   - [ ] prepare/check + close

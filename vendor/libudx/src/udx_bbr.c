@@ -230,17 +230,23 @@ bbr_set_cwnd (udx_stream_t *stream, udx_rate_sample_t *rs, uint32_t acked, doubl
     goto done;
   }
 
-  uint32_t target_cwnd = bbr_bdp(stream, bw, gain);
+  // NOTE (d-hyperswarm): target_cwnd is wrapped in a block so it is out of scope
+  // at `done:`. libudx is compiled as C++ (namespace udx) and C++ forbids a goto
+  // that jumps past an initialized variable into its scope. Behaviour is
+  // unchanged — target_cwnd is used only here. The only C++ patch to libudx.
+  {
+    uint32_t target_cwnd = bbr_bdp(stream, bw, gain);
 
-  target_cwnd += bbr_ack_aggregation_cwnd(stream);
+    target_cwnd += bbr_ack_aggregation_cwnd(stream);
 
-  if (bbr_full_bw_reached(stream)) {
-    cwnd = min_uint32(cwnd + acked, target_cwnd);
-  } else if (cwnd < target_cwnd || stream->delivered < 10) {
-    cwnd = cwnd + acked;
+    if (bbr_full_bw_reached(stream)) {
+      cwnd = min_uint32(cwnd + acked, target_cwnd);
+    } else if (cwnd < target_cwnd || stream->delivered < 10) {
+      cwnd = cwnd + acked;
+    }
+
+    cwnd = max_uint32(cwnd, bbr_cwnd_min_target);
   }
-
-  cwnd = max_uint32(cwnd, bbr_cwnd_min_target);
 done:
   stream->cwnd = cwnd;
   assert(stream->cwnd > 0);

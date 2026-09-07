@@ -7,5 +7,6 @@ int main(string[] args)
 {
     return args.runTests!(
         "tests.cenc_test",
+        "tests.udx_link_test",
     );
 }
