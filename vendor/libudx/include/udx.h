@@ -1,8 +1,16 @@
 #ifndef UDX_H
 #define UDX_H
 
+// NOTE (d-hyperswarm): libudx's extern "C" guard is disabled on purpose. We
+// compile the whole library as C++ inside `namespace udx` (see
+// vendor/libudx-amalgam/udx_amalgam.cpp); with extern "C" the public API would
+// keep C linkage and escape the namespace. Disabled, the public udx_* functions
+// are enclosed under udx:: too, and D calls them via extern(C++, "udx"). The
+// matching close guard at the tail is disabled as well. (2nd of two C++ patches.)
+#if 0
 #ifdef __cplusplus
 extern "C" {
+#endif
 #endif
 
 #include <math.h>
@@ -692,7 +700,10 @@ udx_interface_event_close (udx_interface_event_t *handle);
 uint32_t
 udx_rtt_min (udx_stream_t *stream);
 
+// NOTE (d-hyperswarm): disabled together with the open guard at the head — see there.
+#if 0
 #ifdef __cplusplus
 }
+#endif
 #endif
 #endif // UDX_H
