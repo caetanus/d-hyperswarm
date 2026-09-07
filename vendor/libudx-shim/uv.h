@@ -26,6 +26,48 @@ extern "C" {
 #include <netdb.h>       // struct addrinfo
 #include <errno.h>
 
+// ── symbol isolation ─────────────────────────────────────────────────────────
+// The facade FUNCTIONS are the only symbols that could clash with a real libuv if
+// one is ever linked into the same binary (the udx_* symbols are unique to libudx;
+// the uv types and UV_E* codes are compile-time only and emit no symbols). We prefix
+// the function names to hsuv_* so the facade exposes no global uv_* symbol. The
+// preprocessor rewrites whole tokens, so both these declarations and libudx's own
+// calls become hsuv_*; our D implementation exports hsuv_*. libudx's source is
+// untouched. (uv_close_cb etc. are distinct tokens and are NOT affected.)
+#define uv_now                          hsuv_now
+#define uv_hrtime                       hsuv_hrtime
+#define uv_buf_init                     hsuv_buf_init
+#define uv_close                        hsuv_close
+#define uv_is_active                    hsuv_is_active
+#define uv_fileno                       hsuv_fileno
+#define uv_recv_buffer_size             hsuv_recv_buffer_size
+#define uv_send_buffer_size             hsuv_send_buffer_size
+#define uv_udp_init                     hsuv_udp_init
+#define uv_udp_bind                     hsuv_udp_bind
+#define uv_udp_recv_start               hsuv_udp_recv_start
+#define uv_udp_getsockname              hsuv_udp_getsockname
+#define uv_udp_send                     hsuv_udp_send
+#define uv_udp_try_send                 hsuv_udp_try_send
+#define uv_udp_set_ttl                  hsuv_udp_set_ttl
+#define uv_udp_set_multicast_loop       hsuv_udp_set_multicast_loop
+#define uv_udp_set_multicast_interface  hsuv_udp_set_multicast_interface
+#define uv_udp_set_membership           hsuv_udp_set_membership
+#define uv_udp_set_source_membership    hsuv_udp_set_source_membership
+#define uv_timer_init                   hsuv_timer_init
+#define uv_timer_start                  hsuv_timer_start
+#define uv_timer_stop                   hsuv_timer_stop
+#define uv_prepare_init                 hsuv_prepare_init
+#define uv_prepare_start                hsuv_prepare_start
+#define uv_prepare_stop                 hsuv_prepare_stop
+#define uv_check_init                   hsuv_check_init
+#define uv_check_start                  hsuv_check_start
+#define uv_check_stop                   hsuv_check_stop
+#define uv_getaddrinfo                  hsuv_getaddrinfo
+#define uv_freeaddrinfo                 hsuv_freeaddrinfo
+#define uv_interface_addresses          hsuv_interface_addresses
+#define uv_free_interface_addresses     hsuv_free_interface_addresses
+#define uv_strerror                     hsuv_strerror
+
 // ── error codes ──────────────────────────────────────────────────────────────
 // libuv's convention on Unix: negative errno, with UV_EOF a sentinel. libudx only
 // compares return codes against these, and our facade returns the same constants,
