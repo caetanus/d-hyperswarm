@@ -96,7 +96,10 @@ Isolated local DHT for unit tests: bootstrap `[]`.
   - [x] loop + timer + buf: `Loop` runner on vibe (fire due timers → sleep to next
         deadline/wake → repeat); hsuv_timer_*/now/hrtime/buf_init/close/is_active live;
         tests: one-shot fires once after timeout, repeating re-arms until stopped
-  - [ ] UDP on vibe UDPConnection
+  - [x] UDP on vibe UDPConnection: init/bind/recv_start (reader fiber → alloc+recv
+        cbs)/getsockname/send (fiber)/try_send (raw non-blocking sendmsg)/set_ttl
+        (setsockopt via fd — holepunch needs it)/buffer-sizes/fileno; multicast stubbed.
+        Test: a datagram sent through the facade is received on the vibe loop
   - [ ] prepare/check + close
   - [ ] getaddrinfo + interfaces + strerror
   - [ ] udx echo D↔D, then acceptance D↔JS

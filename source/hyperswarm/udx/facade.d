@@ -6,7 +6,13 @@
 /// this module defines. libudx never calls uv_run: WE drive the callbacks from a
 /// vibe fiber (`Loop.run`), so there is one event loop (vibe's), single-threaded.
 ///
-/// STATUS: loop + timers + buffers are live; UDP / prepare / check / getaddrinfo /
+/// Cooperative single-threading is what makes this safe: a libudx callback (recv,
+/// timer, send-done) is plain C and never yields, so it runs to completion before
+/// any other fiber gets the CPU — libudx never sees its own state half-mutated by
+/// another fiber. The reader fiber, the loop runner and send tasks interleave only
+/// at their vibe yield points.
+///
+/// STATUS: loop + timers + buffers + UDP are live; prepare/check, getaddrinfo and
 /// interfaces are still stubs (they assert if called). See notes/uv-facade.md.
 ///
 /// Every `hsuv_*` function is `nothrow`: libudx is C and a D exception unwinding
@@ -15,11 +21,27 @@
 module hyperswarm.udx.facade;
 
 import core.time : MonoTime, Duration, msecs;
+import core.stdc.errno : errno, EAGAIN, EWOULDBLOCK;
+import core.sys.posix.sys.socket : sockaddr, socklen_t, msghdr, iovec, sendmsg,
+    setsockopt, getsockopt, SOL_SOCKET, SO_SNDBUF, SO_RCVBUF, AF_INET, AF_INET6;
+import core.sys.posix.netinet.in_ : sockaddr_in, sockaddr_in6, IPPROTO_IP;
 import vibe.core.sync : LocalManualEvent, createManualEvent;
+import vibe.core.net : UDPConnection, NetworkAddress, listenUDP;
+import vibe.core.core : runTask;
+
+// Linux socket-option constants not always surfaced by druntime imports.
+private enum int IP_TTL = 2;
+private enum int IPPROTO_IPV6 = 41;
+private enum int IPV6_UNICAST_HOPS = 16;
+private enum int MSG_DONTWAIT = 0x40;
+
+// libuv error codes we return (mirroring the shim's negative-errno convention).
+private enum int UV_EAGAIN = -EAGAIN;
+private enum int UV_EINVAL = -22;
 
 // ── C struct layouts (must match vendor/libudx-shim/uv.h) ────────────────────
 
-/// `uv_buf_t { char* base; size_t len; }` — for ABI-correct by-value return.
+/// `uv_buf_t { char* base; size_t len; }` — laid out identically to `iovec`.
 struct uv_buf_t
 {
     char* base;
@@ -34,8 +56,7 @@ struct uv_loop_t
 }
 
 /// The common prefix every uv handle begins with (UV_HANDLE_FIELDS in the shim).
-/// libudx only ever touches `.data`; we use `.loop`/`.impl`/`.active`. All handle
-/// types share this layout, so one struct serves the facade.
+/// libudx only ever touches `.data`; we use `.loop`/`.impl`/`.active`/`.type`.
 struct uv_handle_t
 {
     void* data;
@@ -47,8 +68,8 @@ struct uv_handle_t
     void* impl;
 }
 
-/// A timer handle is layout-identical to the common prefix.
 alias uv_timer_t = uv_handle_t;
+alias uv_udp_t = uv_handle_t;
 
 /// uv handle type tags (order matches the shim enum).
 private enum : int
@@ -63,6 +84,26 @@ private enum : int
 
 private alias CTimerCb = extern (C) void function(uv_handle_t*) nothrow;
 private alias CCloseCb = extern (C) void function(uv_handle_t*) nothrow;
+private alias CAllocCb = extern (C) void function(uv_handle_t*, size_t, uv_buf_t*) nothrow;
+private alias CRecvCb = extern (C) void function(uv_handle_t*, ptrdiff_t, const(uv_buf_t)*, const(sockaddr)*, uint) nothrow;
+private alias CSendCb = extern (C) void function(void*, int) nothrow;
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+private NetworkAddress toNetworkAddress(const(sockaddr)* sa) nothrow @trusted
+{
+    // Copy the raw sockaddr bytes through sockAddr (no family precondition);
+    // sockAddrInet4/6 assert on family, which a fresh NetworkAddress hasn't set.
+    NetworkAddress na;
+    immutable len = sockaddrLen(sa);
+    (cast(ubyte*) na.sockAddr)[0 .. len] = (cast(const(ubyte)*) sa)[0 .. len];
+    return na;
+}
+
+private socklen_t sockaddrLen(const(sockaddr)* sa) nothrow @trusted
+{
+    return sa.sa_family == AF_INET ? sockaddr_in.sizeof : sockaddr_in6.sizeof;
+}
 
 // ── the event loop (driven by a vibe fiber) ──────────────────────────────────
 
@@ -80,16 +121,40 @@ private struct PendingClose
     CCloseCb cb;
 }
 
-/// One libuv loop, backed by vibe. libudx registers timers (and, later, UDP
-/// sockets and prepare/check hooks) against it; `run` is the loop-runner a vibe
-/// fiber drives: fire due timers, sleep until the next deadline or an explicit
-/// wake, repeat. `uv_now` reads the cached time refreshed each turn.
+/// Per-UDP-socket state. The vibe UDPConnection carries the socket; a reader
+/// fiber turns its blocking recv into libuv's alloc_cb+recv_cb callbacks.
+private final class UdpState
+{
+    Loop loop;
+    uv_udp_t* handle;
+    UDPConnection conn;
+    int family; // 4 or 6, from the bound address
+    bool bound;
+    bool receiving;
+    CAllocCb allocCb;
+    CRecvCb recvCb;
+
+    this(Loop l, uv_udp_t* h) nothrow
+    {
+        loop = l;
+        handle = h;
+    }
+
+    int fd() nothrow @trusted
+    {
+        return conn.fd;
+    }
+}
+
+/// One libuv loop, backed by vibe. libudx registers timers and UDP sockets
+/// against it; `run` is the loop-runner a vibe fiber drives.
 final class Loop
 {
     private uv_loop_t cLoop;
     private ulong nowMs;
     private MonoTime epoch;
     private TimerState[void*] timers; // keyed by the handle pointer
+    private UdpState[void*] udps; // keyed by the handle pointer
     private PendingClose[] pendingCloses;
     private LocalManualEvent wake;
     private bool running;
@@ -136,8 +201,6 @@ final class Loop
     // Only called from run() (already non-nothrow); the `due` append may allocate.
     private void fireExpired()
     {
-        // Collect due handles first: a callback may start/stop/close timers, and
-        // we must not mutate the map mid-iteration.
         void*[] due;
         foreach (h, ref t; timers)
             if (t.active && t.deadline <= nowMs)
@@ -193,20 +256,24 @@ final class Loop
                 if (dms <= 0)
                 {
                     updateNow();
-                    continue; // already due — loop back to fire
+                    continue;
                 }
                 wake.wait(dms.msecs, cnt);
             }
             else
-                wake.wait(cnt); // nothing scheduled — wait for a wake
+                wake.wait(cnt);
             updateNow();
         }
     }
 
-    /// Ask the runner to exit at the next turn.
     void stop() nothrow
     {
         running = false;
+        poke();
+    }
+
+    private void poke() nothrow
+    {
         try
             wake.emit();
         catch (Exception)
@@ -214,7 +281,7 @@ final class Loop
         }
     }
 
-    // ── operations invoked from the hsuv_* shims ─────────────────────────────
+    // ── timer ops ────────────────────────────────────────────────────────────
     private void registerTimer(void* h) nothrow
     {
         timers[h] = TimerState.init;
@@ -242,29 +309,43 @@ final class Loop
         poke();
     }
 
+    // ── udp ops ──────────────────────────────────────────────────────────────
+    private void registerUdp(void* h, UdpState st) nothrow
+    {
+        udps[h] = st;
+    }
+
+    // ── close ────────────────────────────────────────────────────────────────
     private void closeHandle(uv_handle_t* h, CCloseCb cb) nothrow
     {
-        timers.remove(cast(void*) h);
+        auto key = cast(void*) h;
+        if (auto st = key in udps)
+        {
+            st.receiving = false;
+            try
+                st.conn.close();
+            catch (Exception)
+            {
+            }
+            udps.remove(key);
+        }
+        timers.remove(key);
         h.active = 0;
         h.closing = 1;
         if (cb !is null)
             pendingCloses ~= PendingClose(h, cb);
         poke();
     }
-
-    private void poke() nothrow
-    {
-        try
-            wake.emit();
-        catch (Exception)
-        {
-        }
-    }
 }
 
 private Loop loopOf(void* loopPtr) nothrow
 {
     return cast(Loop)(cast(uv_loop_t*) loopPtr).impl;
+}
+
+private UdpState udpOf(uv_handle_t* h) nothrow
+{
+    return cast(UdpState) h.impl;
 }
 
 // ── the hsuv_* facade (C ABI, nothrow) ───────────────────────────────────────
@@ -286,7 +367,6 @@ ulong hsuv_hrtime() nothrow
 {
     immutable t = MonoTime.currTime.ticks;
     immutable freq = MonoTime.ticksPerSecond;
-    // ns = ticks * 1e9 / ticksPerSecond, kept in integers to avoid rounding drift.
     return cast(ulong)(t / freq) * 1_000_000_000UL
         + cast(ulong)((t % freq) * 1_000_000_000UL / freq);
 }
@@ -310,9 +390,42 @@ int hsuv_is_active(const(void)* handle) nothrow
     return (cast(uv_handle_t*) handle).active;
 }
 
-int hsuv_fileno(const(void)* handle, int* fd) nothrow { nyi("uv_fileno"); }
-int hsuv_recv_buffer_size(void* handle, int* value) nothrow { nyi("uv_recv_buffer_size"); }
-int hsuv_send_buffer_size(void* handle, int* value) nothrow { nyi("uv_send_buffer_size"); }
+int hsuv_fileno(const(void)* handle, int* fd) nothrow
+{
+    auto st = udpOf(cast(uv_handle_t*) handle);
+    if (st is null || !st.bound)
+        return UV_EINVAL;
+    *fd = st.fd;
+    return 0;
+}
+
+int hsuv_recv_buffer_size(void* handle, int* value) nothrow
+{
+    return bufferSize(cast(uv_handle_t*) handle, SO_RCVBUF, value);
+}
+
+int hsuv_send_buffer_size(void* handle, int* value) nothrow
+{
+    return bufferSize(cast(uv_handle_t*) handle, SO_SNDBUF, value);
+}
+
+// libuv semantics: *value == 0 → get current into *value; else set it. Linux
+// doubles the SO_*BUF value it stores, matching what libuv reports.
+private int bufferSize(uv_handle_t* h, int opt, int* value) nothrow @trusted
+{
+    auto st = udpOf(h);
+    if (st is null || !st.bound)
+        return UV_EINVAL;
+    if (*value == 0)
+    {
+        socklen_t len = int.sizeof;
+        if (getsockopt(st.fd, SOL_SOCKET, opt, value, &len) != 0)
+            return -errno;
+    }
+    else if (setsockopt(st.fd, SOL_SOCKET, opt, value, int.sizeof) != 0)
+        return -errno;
+    return 0;
+}
 
 // ── timers ───────────────────────────────────────────────────────────────────
 int hsuv_timer_init(void* loop, void* handle) nothrow
@@ -344,17 +457,171 @@ int hsuv_timer_stop(void* handle) nothrow
 }
 
 // ── UDP ──────────────────────────────────────────────────────────────────────
-int hsuv_udp_init(void* loop, void* handle) nothrow { nyi("uv_udp_init"); }
-int hsuv_udp_bind(void* handle, const(void)* addr, uint flags) nothrow { nyi("uv_udp_bind"); }
-int hsuv_udp_recv_start(void* handle, void* alloc_cb, void* recv_cb) nothrow { nyi("uv_udp_recv_start"); }
-int hsuv_udp_getsockname(const(void)* handle, void* name, int* namelen) nothrow { nyi("uv_udp_getsockname"); }
-int hsuv_udp_send(void* req, void* handle, const(uv_buf_t)* bufs, uint nbufs, const(void)* addr, void* send_cb) nothrow { nyi("uv_udp_send"); }
-int hsuv_udp_try_send(void* handle, const(uv_buf_t)* bufs, uint nbufs, const(void)* addr) nothrow { nyi("uv_udp_try_send"); }
-int hsuv_udp_set_ttl(void* handle, int ttl) nothrow { nyi("uv_udp_set_ttl"); }
-int hsuv_udp_set_multicast_loop(void* handle, int on) nothrow { nyi("uv_udp_set_multicast_loop"); }
-int hsuv_udp_set_multicast_interface(void* handle, const(char)* interface_addr) nothrow { nyi("uv_udp_set_multicast_interface"); }
-int hsuv_udp_set_membership(void* handle, const(char)* multicast_addr, const(char)* interface_addr, int membership) nothrow { nyi("uv_udp_set_membership"); }
-int hsuv_udp_set_source_membership(void* handle, const(char)* multicast_addr, const(char)* interface_addr, const(char)* source_addr, int membership) nothrow { nyi("uv_udp_set_source_membership"); }
+int hsuv_udp_init(void* loop, void* handle) nothrow
+{
+    auto h = cast(uv_handle_t*) handle;
+    h.loop = cast(uv_loop_t*) loop;
+    h.type = UV_UDP;
+    h.active = 0;
+    h.closing = 0;
+    auto lp = loopOf(loop);
+    auto st = new UdpState(lp, h);
+    h.impl = cast(void*) st;
+    lp.registerUdp(handle, st);
+    return 0;
+}
+
+int hsuv_udp_bind(void* handle, const(void)* addr, uint flags) nothrow
+{
+    auto h = cast(uv_handle_t*) handle;
+    auto st = udpOf(h);
+    if (st is null)
+        return UV_EINVAL;
+    auto sa = cast(const(sockaddr)*) addr;
+    try
+    {
+        auto na = toNetworkAddress(sa);
+        st.conn = listenUDP(na);
+        st.family = sa.sa_family == AF_INET ? 4 : 6;
+        st.bound = true;
+        h.active = 1;
+    }
+    catch (Exception)
+        return UV_EINVAL;
+    return 0;
+}
+
+int hsuv_udp_getsockname(const(void)* handle, void* name, int* namelen) nothrow
+{
+    auto st = udpOf(cast(uv_handle_t*) handle);
+    if (st is null || !st.bound)
+        return UV_EINVAL;
+    try
+    {
+        auto na = st.conn.localAddress;
+        immutable len = na.sockAddrLen;
+        (cast(ubyte*) name)[0 .. len] = (cast(ubyte*) na.sockAddr)[0 .. len];
+        *namelen = len;
+    }
+    catch (Exception)
+        return UV_EINVAL;
+    return 0;
+}
+
+int hsuv_udp_recv_start(void* handle, void* alloc_cb, void* recv_cb) nothrow
+{
+    auto h = cast(uv_handle_t*) handle;
+    auto st = udpOf(h);
+    if (st is null || !st.bound)
+        return UV_EINVAL;
+    st.allocCb = cast(CAllocCb) alloc_cb;
+    st.recvCb = cast(CRecvCb) recv_cb;
+    if (st.receiving)
+        return 0;
+    st.receiving = true;
+    try
+        runTask(&readerLoop, st);
+    catch (Exception)
+        return UV_EINVAL;
+    return 0;
+}
+
+// The bridge: turn vibe's blocking recv into libuv's alloc_cb + recv_cb. Runs on
+// its own fiber; the callbacks it invokes are libudx C and never yield, so they
+// are atomic w.r.t. the loop runner and timers.
+private void readerLoop(UdpState st) nothrow
+{
+    while (st.receiving)
+    {
+        uv_buf_t buf;
+        st.allocCb(st.handle, 65536, &buf);
+        NetworkAddress peer;
+        ubyte[] got;
+        try
+            got = st.conn.recv(cast(ubyte[]) buf.base[0 .. buf.len], &peer);
+        catch (Exception)
+            break; // interrupted or closed
+        if (!st.receiving)
+            break;
+        if (got is null)
+            continue;
+        st.recvCb(st.handle, cast(ptrdiff_t) got.length, &buf,
+            cast(const(sockaddr)*) peer.sockAddr, 0);
+    }
+}
+
+int hsuv_udp_send(void* req, void* handle, const(uv_buf_t)* bufs, uint nbufs, const(void)* addr, void* send_cb) nothrow
+{
+    auto st = udpOf(cast(uv_handle_t*) handle);
+    if (st is null || !st.bound)
+        return UV_EINVAL;
+    auto cb = cast(CSendCb) send_cb;
+    try
+    {
+        // Coalesce the buffers and hand the send to a fiber, which lets vibe wait
+        // for writability rather than dropping on a full socket buffer. The
+        // send_cb fires from that fiber (cooperative — atomic w.r.t. libudx).
+        size_t total;
+        foreach (i; 0 .. nbufs)
+            total += bufs[i].len;
+        auto data = new ubyte[total];
+        size_t off;
+        foreach (i; 0 .. nbufs)
+        {
+            data[off .. off + bufs[i].len] = cast(ubyte[]) bufs[i].base[0 .. bufs[i].len];
+            off += bufs[i].len;
+        }
+        auto peer = toNetworkAddress(cast(const(sockaddr)*) addr);
+        auto conn = st.conn;
+        runTask(() nothrow {
+            int status = 0;
+            try
+                conn.send(data, &peer);
+            catch (Exception)
+                status = -1;
+            if (cb !is null)
+                cb(req, status);
+        });
+    }
+    catch (Exception)
+        return UV_EINVAL;
+    return 0;
+}
+
+int hsuv_udp_try_send(void* handle, const(uv_buf_t)* bufs, uint nbufs, const(void)* addr) nothrow @trusted
+{
+    auto st = udpOf(cast(uv_handle_t*) handle);
+    if (st is null || !st.bound)
+        return UV_EINVAL;
+    auto sa = cast(const(sockaddr)*) addr;
+    msghdr msg;
+    msg.msg_name = cast(void*) sa;
+    msg.msg_namelen = sockaddrLen(sa);
+    msg.msg_iov = cast(iovec*) bufs; // uv_buf_t and iovec share layout
+    msg.msg_iovlen = nbufs;
+    immutable n = sendmsg(st.fd, &msg, MSG_DONTWAIT);
+    if (n < 0)
+        return (errno == EAGAIN || errno == EWOULDBLOCK) ? UV_EAGAIN : -errno;
+    return cast(int) n;
+}
+
+int hsuv_udp_set_ttl(void* handle, int ttl) nothrow @trusted
+{
+    auto st = udpOf(cast(uv_handle_t*) handle);
+    if (st is null || !st.bound)
+        return UV_EINVAL;
+    int r;
+    if (st.family == 6)
+        r = setsockopt(st.fd, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &ttl, int.sizeof);
+    else
+        r = setsockopt(st.fd, IPPROTO_IP, IP_TTL, &ttl, int.sizeof);
+    return r == 0 ? 0 : -errno;
+}
+
+int hsuv_udp_set_multicast_loop(void* handle, int on) nothrow { return 0; }
+int hsuv_udp_set_multicast_interface(void* handle, const(char)* interface_addr) nothrow { return 0; }
+int hsuv_udp_set_membership(void* handle, const(char)* multicast_addr, const(char)* interface_addr, int membership) nothrow { return 0; }
+int hsuv_udp_set_source_membership(void* handle, const(char)* multicast_addr, const(char)* interface_addr, const(char)* source_addr, int membership) nothrow { return 0; }
 
 // ── prepare / check (loop-phase hooks) ───────────────────────────────────────
 int hsuv_prepare_init(void* loop, void* prepare) nothrow { nyi("uv_prepare_init"); }
