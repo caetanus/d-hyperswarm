@@ -30,10 +30,16 @@ siblings under `~/lab`:
 
 2. **UDX** — `libudx` is a standalone C library (~5–6k LOC C: reliable, multiplexed,
    congestion-controlled streams over UDP; BBR/RACK/TLP/MTU). `udx-native` is only a
-   binding. **VENDOR-C** (dstep over `include/udx.h`), per the ngtcp2/libdatachannel
-   precedent — we do not reimplement reliable UDP. The C API already exposes the
-   holepunch primitives we will need: `udx_stream_change_remote`, `udx_stream_relay_to`,
-   `udx_stream_firewall`. Acceptance: reliable echo D↔JS over UDX.
+   binding. We **vendor the C** (`vendor/libudx`, pin `01d6630`) — we do not reimplement
+   reliable UDP. The C API already exposes the holepunch primitives we will need:
+   `udx_stream_change_remote`, `udx_stream_relay_to`, `udx_stream_firewall`.
+
+   **libudx is written against libuv, but we do NOT use libuv.** Instead we compile its C
+   against our own `uv.h` and implement the ~40-function libuv subset it uses on top of
+   vibe-core — a **libuv→vibe facade**. One event loop (vibe's), single-threaded, no
+   cross-thread. This is possible because libudx never calls `uv_run` (we drive the
+   callbacks) and treats uv handles as opaque but for `.data`. Full spec:
+   `notes/uv-facade.md`. Acceptance: reliable echo D↔JS over UDX.
 
 3. **secret-stream** — `Noise_XX_Ed25519_ChaChaPoly_BLAKE2b`. DH runs **directly on the
    Ed25519 curve** (`crypto_scalarmult_ed25519_noclamp`), **no** ed25519→x25519
