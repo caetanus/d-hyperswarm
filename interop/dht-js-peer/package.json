@@ -1,0 +1,1 @@
+{ "name": "dht-interop-peer", "version": "1.0.0", "private": true, "dependencies": { "dht-rpc": "^6.15.1" } }

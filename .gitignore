@@ -8,3 +8,5 @@ interop/udx-js-peer/node_modules/
 interop/udx-js-peer/package-lock.json
 interop/secretstream-js-peer/node_modules/
 interop/secretstream-js-peer/package-lock.json
+interop/dht-js-peer/node_modules/
+interop/dht-js-peer/package-lock.json

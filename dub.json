@@ -47,6 +47,20 @@
 			]
 		},
 		{
+			"name": "dht-interop-peer",
+			"targetType": "executable",
+			"targetName": "dht-interop-peer",
+			"mainSourceFile": "interop/dht-dpeer/app.d",
+			"sourcePaths": [
+				"source",
+				"interop/dht-dpeer"
+			],
+			"importPaths": [
+				"source",
+				"interop/dht-dpeer"
+			]
+		},
+		{
 			"name": "secretstream-interop-peer",
 			"targetType": "executable",
 			"targetName": "secretstream-interop-peer",
