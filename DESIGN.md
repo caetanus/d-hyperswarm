@@ -113,8 +113,11 @@ Isolated local DHT for unit tests: bootstrap `[]`.
         byte-exact vs the JS (noise-handshake/noise-curve-ed), on libsodium
   - [x] Noise XX handshake (SymmetricState + the 3 messages) — byte-exact vs the JS
         with fixed static+ephemeral keys; random-ephemeral run agrees on tx/rx/hash
-  - [ ] secret-stream transport (uint24-LE framing + secretstream Push/Pull)
-  - [ ] acceptance: handshake + encrypted echo D⇄JS vs @hyperswarm/secret-stream
+  - [x] secret-stream transport (uint24-LE framing + secretstream Push/Pull) — sans-io
+        SecretStream; D⇄D handshake + encrypted echo
+  - [x] **acceptance: D⇄JS vs @hyperswarm/secret-stream** — handshake + encrypted echo
+        round-trips over TCP (interop/run-secretstream-interop.sh), deterministic.
+        secret-stream is wire-compatible. **Phase 3 complete.**
 - [ ] Phase 4: dht-rpc
 - [ ] Phase 5: hyperdht (+ holepunch)
 - [ ] Phase 6: hyperswarm

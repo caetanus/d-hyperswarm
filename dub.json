@@ -47,6 +47,20 @@
 			]
 		},
 		{
+			"name": "secretstream-interop-peer",
+			"targetType": "executable",
+			"targetName": "secretstream-interop-peer",
+			"mainSourceFile": "interop/ss-dpeer/app.d",
+			"sourcePaths": [
+				"source",
+				"interop/ss-dpeer"
+			],
+			"importPaths": [
+				"source",
+				"interop/ss-dpeer"
+			]
+		},
+		{
 			"name": "ut",
 			"targetType": "executable",
 			"targetName": "hyperswarm-test",

@@ -1,0 +1,6 @@
+{
+  "name": "secretstream-interop-peer",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": { "@hyperswarm/secret-stream": "^6.6.2" }
+}
