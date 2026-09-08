@@ -22,5 +22,6 @@ int main(string[] args)
         "tests.noise_crypto_test",
         "tests.noise_hs_test",
         "tests.secretstream_test",
+        "tests.dht_wire_test",
     );
 }
