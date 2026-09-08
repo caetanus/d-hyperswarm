@@ -118,6 +118,13 @@ Isolated local DHT for unit tests: bootstrap `[]`.
   - [x] **acceptance: D⇄JS vs @hyperswarm/secret-stream** — handshake + encrypted echo
         round-trips over TCP (interop/run-secretstream-interop.sh), deterministic.
         secret-stream is wire-compatible. **Phase 3 complete.**
+- [ ] Phase 4: dht-rpc (Kademlia over UDP/UDX) — wire in the module docs
+  - [x] packet wire codec (request/reply/nodeId) byte-exact; FIND_NODE round-trips
+        against a real dht-rpc node (interop/run-dht-interop.sh)
+  - [ ] Kademlia routing table + iterative query engine (find_node toward a target)
+  - [ ] node lifecycle (ping maintenance, tokens) — enough for hyperdht to ride on
+- [ ] Phase 5: hyperdht — announce/lookup by topic, connect-by-key, and HOLEPUNCH (the crux)
+- [ ] Phase 6: hyperswarm — join(topic)/on(connection), dedup + backoff
 - [ ] Phase 4: dht-rpc
 - [ ] Phase 5: hyperdht (+ holepunch)
 - [ ] Phase 6: hyperswarm
