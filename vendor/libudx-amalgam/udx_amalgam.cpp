@@ -91,6 +91,14 @@ int hs_udx_socket_getsockname (void *s, struct sockaddr *name, int *name_len) {
 int hs_udx_socket_close (void *s) {
   return udx::udx_socket_close((udx::udx_socket_t *) s);
 }
+size_t hs_udx_sizeof_socket_send (void) { return sizeof(udx::udx_socket_send_t); }
+int hs_udx_socket_send (void *req, void *s, const uv_buf_t bufs[], unsigned int bufs_len, const struct sockaddr *addr, void *cb) {
+  return udx::udx_socket_send((udx::udx_socket_send_t *) req, (udx::udx_socket_t *) s, bufs, bufs_len, addr,
+                             (udx::udx_socket_send_cb) cb);
+}
+int hs_udx_socket_recv_start (void *s, void *recv_cb) {
+  return udx::udx_socket_recv_start((udx::udx_socket_t *) s, (udx::udx_socket_recv_cb) recv_cb);
+}
 
 int hs_udx_stream_init (void *u, void *stream, uint32_t local_id, void *close_cb, void *finalize_cb) {
   return udx::udx_stream_init((udx::udx_t *) u, (udx::udx_stream_t *) stream, local_id,

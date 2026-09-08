@@ -12,15 +12,15 @@ import hyperswarm.dht.node : Dht;
 import hyperswarm.dht.connect : connectHandshake;
 import hyperswarm.connection : Connection, hsConnRead, hsConnClose, hsConnFinalize;
 import hyperswarm.udx.udx;
-import hyperswarm.udx.facade : Loop, uv_buf_t;
+import hyperswarm.udx.facade : uv_buf_t;
 import hyperswarm.noise.stream : SecretStream;
 import hyperswarm.noise.crypto : Keypair, ed25519Keypair, ed25519RandomKeypair;
 import hyperswarm.cenc : Address;
 import vibe.core.core : runTask, sleep;
-import core.time : msecs, Duration, seconds;
-import core.sys.posix.sys.socket : sockaddr, sockaddr_storage, AF_INET;
+import core.time : msecs;
+import core.sys.posix.sys.socket : sockaddr, AF_INET;
 import core.sys.posix.netinet.in_ : sockaddr_in;
-import core.sys.posix.arpa.inet : htonl, htons, ntohs, inet_addr;
+import core.sys.posix.arpa.inet : htons, inet_addr;
 import std.random : uniform;
 import std.format : format;
 import std.string : toStringz;
@@ -41,9 +41,6 @@ final class Hyperswarm
 {
     Keypair keyPair;
     Dht dht;
-    private Loop loop;
-    private ubyte[] udx; // opaque udx instance
-    private ubyte[] sock; // opaque udx socket, bound for connections
     private Address ourUdxAddr;
 
     private Connection[string] connections; // by remote pubkey hex (de-dup)
@@ -62,24 +59,11 @@ final class Hyperswarm
     {
         keyPair = seed.length == 32 ? ed25519Keypair(seed) : ed25519RandomKeypair();
 
-        loop = new Loop();
-        runTask(() nothrow { try loop.run(); catch (Exception) {} });
-
-        udx = new ubyte[](hs_udx_sizeof_udx());
-        hs_udx_init(loop.chandle, udx.ptr, null);
-        sock = new ubyte[](hs_udx_sizeof_socket());
-        hs_udx_socket_init(udx.ptr, sock.ptr, null);
-        sockaddr_in bindv4;
-        bindv4.sin_family = AF_INET;
-        bindv4.sin_addr.s_addr = htonl(0x7f00_0001);
-        bindv4.sin_port = 0;
-        hs_udx_socket_bind(sock.ptr, cast(sockaddr*)&bindv4, 0);
-        sockaddr_storage ss;
-        int sl = cast(int) ss.sizeof;
-        hs_udx_socket_getsockname(sock.ptr, &ss, &sl);
-        ourUdxAddr = Address("127.0.0.1", 4, ntohs((cast(sockaddr_in*)&ss).sin_port));
-
+        // The Dht owns the udx socket that carries both dht-rpc and our connection
+        // streams (one socket, like hyperdht) — so the address a server sees our
+        // handshake come from is the very socket our stream lives on.
         dht = new Dht(bootstrap);
+        ourUdxAddr = Address("127.0.0.1", 4, dht.rpc.localPort);
     }
 
     /// Start discovering and connecting to the peers sharing `topic` (client
@@ -188,12 +172,12 @@ final class Hyperswarm
         auto ch = connectHandshake(dht, pubkey, keyPair, ourUdxAddr, ourUdxId);
 
         auto stream = new ubyte[](hs_udx_sizeof_stream());
-        hs_udx_stream_init(udx.ptr, stream.ptr, ourUdxId, &hsConnClose, &hsConnFinalize);
+        hs_udx_stream_init(dht.rpc.udxPtr, stream.ptr, ourUdxId, &hsConnClose, &hsConnFinalize);
         hs_udx_stream_read_start(stream.ptr, &hsConnRead);
 
         auto ss = SecretStream.fromHandshake(true, ch.hs.tx, ch.hs.rx, ch.hs.hash,
             ch.hs.remotePublicKey);
-        auto conn = new Connection(udx.ptr, stream.ptr, ss, ch.hs.remotePublicKey);
+        auto conn = new Connection(dht.rpc.udxPtr, stream.ptr, ss, ch.hs.remotePublicKey);
 
         // Reach the server at the address it advertised in its noisePayload (its
         // real udx socket), falling back to the handshake's serverAddress. In the
@@ -204,7 +188,7 @@ final class Hyperswarm
         peer.sin_family = AF_INET;
         peer.sin_addr.s_addr = inet_addr(target.host.toStringz);
         peer.sin_port = htons(target.port);
-        hs_udx_stream_connect(stream.ptr, sock.ptr, ch.serverPayload.udx.id, cast(sockaddr*)&peer);
+        hs_udx_stream_connect(stream.ptr, dht.rpc.sockPtr, ch.serverPayload.udx.id, cast(sockaddr*)&peer);
 
         conn.start(); // secret-stream setup frame
         return conn;

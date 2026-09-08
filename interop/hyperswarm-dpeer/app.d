@@ -83,17 +83,16 @@ int main(string[] args)
             };
             g_swarm.join(topic, true, false); // client mode
 
-            for (int i = 0; i < 800 && !g_gotEcho && !g_discovered; i++)
-                sleep(10.msecs);
-            // give the connection a chance once discovered (it currently needs the
-            // rpc/udx socket unification to complete through a relay)
-            for (int i = 0; i < 300 && !g_gotEcho; i++)
+            for (int i = 0; i < 1100 && !g_gotEcho; i++)
                 sleep(10.msecs);
 
             if (g_gotEcho)
+            {
                 writeln("OK hyperswarm encrypted echo worked D<->JS!");
-            if (g_discovered)
-                result = 0; // topic discovery is the validated milestone
+                result = 0; // full join -> discover -> connect -> encrypted echo
+            }
+            else if (g_discovered)
+                writeln("FAIL discovered the peer but the connection did not echo");
             else
                 writeln("FAIL did not discover the topic's peer");
             g_swarm.close();

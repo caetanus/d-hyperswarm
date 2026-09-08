@@ -2,13 +2,13 @@
 # Phase-6: the hyperswarm layer against a REAL hyperswarm. A JS hyperswarm server
 # joins a topic (announce + listen) behind a bootstrapper; the D hyperswarm client
 # joins the same topic, discovers the server's public key by looking the topic up,
-# and attempts to connect.
+# connects through a relay node and echoes an encrypted message.
 #
-# Validated here: topic discovery (join -> lookup -> peer's public key) is
-# wire-compatible with the real hyperswarm. Completing the encrypted connection
-# through a relay node still needs the dht-rpc/udx socket unification (a real
-# hyperswarm always reaches the server through a relay, which reports the client's
-# rpc-socket source; our streams live on a separate socket) — the next step.
+# Proves the full hyperswarm client path is wire-compatible with the real
+# hyperswarm: join -> lookup discovers the server -> connect through a relay node
+# -> peer handshake -> UDX stream -> connection secret-stream -> encrypted echo.
+# (dht-rpc and the connection streams share one udx socket, so the address the
+# server sees our handshake from is the socket our stream lives on.)
 set -u
 cd "$(dirname "$0")/.."
 echo "── building ──"
@@ -25,11 +25,6 @@ kill "$jspid" 2>/dev/null; wait "$jspid" 2>/dev/null
 echo "  D:  $(grep -vE 'leaking|EventCore|FD |Use .-debug|SO_RCVBUF' "$work/d.log" | tail -3 | tr '\n' ' ')"
 echo "  JS: $(tail -1 "$work/js.log")"
 echo
-if [ $dstatus -eq 0 ] && grep -q '^OK discovered' "$work/d.log"; then
-  if grep -q 'encrypted echo' "$work/d.log"; then
-    echo "PASS  hyperswarm join + encrypted connection is wire-compatible"
-  else
-    echo "PASS  hyperswarm topic discovery is wire-compatible (encrypted connection pending socket unification)"
-  fi
-  exit 0
+if [ $dstatus -eq 0 ] && grep -q "encrypted echo" "$work/d.log"; then
+  echo "PASS  full hyperswarm (join -> discover -> connect -> encrypted echo) is wire-compatible"; exit 0
 else echo "FAIL  hyperswarm interop (exit=$dstatus)"; exit 1; fi

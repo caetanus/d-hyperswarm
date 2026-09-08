@@ -29,6 +29,13 @@ int hs_udx_socket_bind(void* s, const(void)* addr, uint flags);
 int hs_udx_socket_getsockname(void* s, void* name, int* name_len);
 int hs_udx_socket_close(void* s);
 
+// Socket datagrams (non-stream): dht-rpc rides on these, sharing the socket with
+// udx streams. recv_start's callback fires for packets that aren't udx-stream
+// packets; send transmits one datagram.
+size_t hs_udx_sizeof_socket_send();
+int hs_udx_socket_send(void* req, void* s, const(uv_buf_t)* bufs, uint bufs_len, const(void)* addr, void* cb);
+int hs_udx_socket_recv_start(void* s, void* recv_cb);
+
 // Streams.
 int hs_udx_stream_init(void* u, void* stream, uint local_id, void* close_cb, void* finalize_cb);
 int hs_udx_stream_connect(void* stream, void* socket, uint remote_id, const(void)* remote_addr);
@@ -44,3 +51,6 @@ alias UdxStreamCloseCb = extern (C) void function(void* stream, int status) noth
 alias UdxStreamFinalizeCb = extern (C) void function(void* stream) nothrow;
 alias UdxStreamReadCb = extern (C) void function(void* stream, ptrdiff_t read_len, const(uv_buf_t)* buf) nothrow;
 alias UdxStreamAckCb = extern (C) void function(void* req, int status, int unordered) nothrow;
+alias UdxSocketRecvCb = extern (C) void function(void* socket, ptrdiff_t read_len,
+    const(uv_buf_t)* buf, const(void)* from) nothrow;
+alias UdxSocketSendCb = extern (C) void function(void* req, int status) nothrow;

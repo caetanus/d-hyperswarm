@@ -1,19 +1,50 @@
-/// The dht-rpc RPC layer over vibe UDP: send a request datagram with a fresh
-/// transaction id and await the matching reply. A reader fiber decodes incoming
-/// replies and wakes the waiting request by tid. Requests are plain UDP (a udx
-/// socket's send is a UDP send), so vibe's UDPConnection is all we need.
+/// The dht-rpc RPC layer over a udx SOCKET (not a bare UDP socket): send a request
+/// datagram with a fresh transaction id and await the matching reply. This matters
+/// for connect — hyperdht runs dht-rpc and the connection's udx streams on ONE udx
+/// socket, so the address a server sees a handshake come from (req.from) is the very
+/// socket the client's stream lives on. We do the same: the udx socket carries both
+/// the rpc datagrams (udx delivers non-stream packets to its recv callback) and the
+/// connection streams, so a peer that connects back to our rpc source reaches our
+/// stream socket.
+///
+/// A recv callback decodes incoming replies and wakes the waiting request by tid.
+/// The udx instance + socket are exposed so the connection layer opens its streams
+/// on the same socket.
 module hyperswarm.dht.rpc;
 
 import hyperswarm.dht.wire;
 import hyperswarm.cenc : Address;
-import vibe.core.net : UDPConnection, NetworkAddress, listenUDP, resolveHost;
+import hyperswarm.udx.udx;
+import hyperswarm.udx.facade : Loop, uv_buf_t;
 import vibe.core.sync : LocalManualEvent, createManualEvent;
 import vibe.core.core : runTask;
+import vibe.core.net : resolveHost;
 import core.time : Duration, seconds;
+import core.sys.posix.sys.socket : sockaddr, sockaddr_storage, AF_INET;
+import core.sys.posix.netinet.in_ : sockaddr_in;
+import core.sys.posix.arpa.inet : htons, ntohs;
+
+// Route the udx socket's non-stream datagrams (dht-rpc replies) to the owning Rpc.
+// Cooperative single-threaded (the facade loop + callbacks run on one vibe thread),
+// so the registry needs no lock.
+private __gshared Rpc[void*] g_rpcBySock;
+
+extern (C) void hsRpcRecv(void* socket, ptrdiff_t len, const(uv_buf_t)* buf, const(void)* from) nothrow
+{
+    if (len <= 0)
+        return;
+    if (auto r = socket in g_rpcBySock)
+        r.onDatagram(cast(ubyte[]) buf.base[0 .. len]);
+}
+
+extern (C) void hsRpcSockClose(void* s) nothrow {}
 
 final class Rpc
 {
-    private UDPConnection sock;
+    Loop loop;
+    private ubyte[] udx; // opaque udx instance
+    private ubyte[] sock; // opaque udx socket (rpc datagrams + connection streams)
+    private ushort _localPort;
     private ushort nextTid = 1;
     private bool running;
 
@@ -26,23 +57,62 @@ final class Rpc
 
     private Pending[ushort] pending;
 
+    // udx may reference a send buffer until the datagram is flushed; keep the last
+    // N (req block + payload) alive in a ring. dht-rpc is low volume, so by the time
+    // a slot is reused its send is long done.
+    private enum SEND_RING = 256;
+    private ubyte[][] sendKeep;
+    private size_t sendIdx;
+
     this(ushort bindPort = 0)
     {
-        sock = listenUDP(bindPort, "0.0.0.0");
+        loop = new Loop();
+        runTask(() nothrow { try loop.run(); catch (Exception) {} });
+
+        udx = new ubyte[](hs_udx_sizeof_udx());
+        hs_udx_init(loop.chandle, udx.ptr, null);
+        sock = new ubyte[](hs_udx_sizeof_socket());
+        hs_udx_socket_init(udx.ptr, sock.ptr, &hsRpcSockClose);
+
+        sockaddr_in b;
+        b.sin_family = AF_INET;
+        b.sin_addr.s_addr = 0; // INADDR_ANY
+        b.sin_port = htons(bindPort);
+        hs_udx_socket_bind(sock.ptr, cast(sockaddr*)&b, 0);
+        sockaddr_storage ss;
+        int sl = cast(int) ss.sizeof;
+        hs_udx_socket_getsockname(sock.ptr, &ss, &sl);
+        _localPort = ntohs((cast(sockaddr_in*)&ss).sin_port);
+
+        sendKeep.length = SEND_RING;
+        g_rpcBySock[sock.ptr] = this;
         running = true;
-        runTask(&readerLoop);
+        hs_udx_socket_recv_start(sock.ptr, &hsRpcRecv);
     }
 
     ushort localPort()
     {
-        return sock.localAddress.port;
+        return _localPort;
+    }
+
+    /// The udx instance the rpc socket lives on — the connection layer opens its
+    /// streams on this same instance/socket so its stream source is our rpc source.
+    void* udxPtr()
+    {
+        return udx.ptr;
+    }
+
+    void* sockPtr()
+    {
+        return sock.ptr;
     }
 
     void close()
     {
         running = false;
+        g_rpcBySock.remove(sock.ptr);
         try
-            sock.close();
+            hs_udx_socket_close(sock.ptr);
         catch (Exception)
         {
         }
@@ -67,46 +137,55 @@ final class Rpc
             pending.remove(tid);
 
         auto req = encodeRequest(tid, to, command, target, value, token, null, internal);
-        auto dst = resolveHost(to.host);
-        dst.port = to.port;
 
         immutable cnt = p.ev.emitCount;
-        sock.send(req, &dst);
+        sendDatagram(req, to);
         p.ev.wait(timeout, cnt);
         if (!p.got)
             throw new Exception("dht: request timed out");
         return p.reply;
     }
 
-    private void readerLoop() nothrow
+    private void sendDatagram(ubyte[] data, Address to)
     {
-        auto buf = new ubyte[](2048);
-        while (running)
+        // resolveHost handles both dotted-quad IPs (immediate) and hostnames (the
+        // live bootstrap is node{1,2,3}.hyperdht.org). udx copies the addr into the
+        // send req, so a transient NetworkAddress is fine.
+        auto na = resolveHost(to.host);
+        na.port = to.port;
+
+        auto sreq = new ubyte[](hs_udx_sizeof_socket_send());
+        // keep the request block + payload alive past this call (udx references the
+        // buffer until the datagram is flushed).
+        sendKeep[sendIdx] = sreq;
+        sendKeep[(sendIdx + 1) % SEND_RING] = data;
+        sendIdx = (sendIdx + 2) % SEND_RING;
+
+        auto b = uv_buf_t(cast(char*) data.ptr, data.length);
+        hs_udx_socket_send(sreq.ptr, sock.ptr, &b, 1, cast(const(void)*) na.sockAddr, null);
+    }
+
+    // Called from the udx socket recv callback with one datagram.
+    package void onDatagram(ubyte[] got) nothrow
+    {
+        if (!running || got.length < 2 || got[0] != RESPONSE_ID)
+            return;
+        Reply r;
+        try
+            // dup: decoded fields slice into the packet, and the recv buffer is
+            // reused — the reply must own its bytes past this callback.
+            r = decodeReply(got.dup);
+        catch (Exception)
+            return;
+        if (auto pp = r.tid in pending)
         {
-            ubyte[] got;
+            auto p = *pp;
+            p.reply = r;
+            p.got = true;
             try
-                got = sock.recv(buf);
+                p.ev.emit();
             catch (Exception)
-                break; // closed
-            if (got.length < 2 || got[0] != RESPONSE_ID)
-                continue;
-            Reply r;
-            try
-                // dup: decoded fields slice into the packet, and `buf` is reused by
-                // the next recv — the reply must own its bytes past this iteration.
-                r = decodeReply(got.dup);
-            catch (Exception)
-                continue;
-            if (auto pp = r.tid in pending)
             {
-                auto p = *pp;
-                p.reply = r;
-                p.got = true;
-                try
-                    p.ev.emit();
-                catch (Exception)
-                {
-                }
             }
         }
     }
