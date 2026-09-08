@@ -63,6 +63,14 @@
 			"importPaths": ["source", "interop/hyperswarm-dpeer"]
 		},
 		{
+			"name": "hyperswarm-dserver",
+			"targetType": "executable",
+			"targetName": "hyperswarm-dserver",
+			"mainSourceFile": "interop/hyperswarm-dserver/app.d",
+			"sourcePaths": ["source", "interop/hyperswarm-dserver"],
+			"importPaths": ["source", "interop/hyperswarm-dserver"]
+		},
+		{
 			"name": "hyperswarm-d2d",
 			"targetType": "executable",
 			"targetName": "hyperswarm-d2d",
