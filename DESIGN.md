@@ -121,10 +121,18 @@ Isolated local DHT for unit tests: bootstrap `[]`.
 - [ ] Phase 4: dht-rpc (Kademlia over UDP/UDX) — wire in the module docs
   - [x] packet wire codec (request/reply/nodeId) byte-exact; FIND_NODE round-trips
         against a real dht-rpc node (interop/run-dht-interop.sh)
-  - [ ] Kademlia routing table + iterative query engine (find_node toward a target)
-  - [ ] node lifecycle (ping maintenance, tokens) — enough for hyperdht to ride on
-- [ ] Phase 5: hyperdht — announce/lookup by topic, connect-by-key, and HOLEPUNCH (the crux)
+  - [x] Kademlia routing table + iterative query engine (find_node toward a target) —
+        live lookup converges on the real network (interop/run-dht-lookup.sh)
+  - [x] tokens + external commands (announce/lookup ride on the query engine)
+- [x] Phase 5: hyperdht — announce/lookup by topic + connect-by-key (encrypted stream)
+  - [x] announce/lookup a topic, wire-compat vs a real hyperdht (interop/run-hyperdht-interop.sh)
+  - [x] Noise IK peer handshake (noise-wrap) + secret-stream from the IK keys
+  - [x] **connect-by-key end to end**: DHT lookup → IK handshake over PEER_HANDSHAKE →
+        UDX stream → connection secret-stream → encrypted echo, wire-compat vs a real
+        hyperdht server (interop/run-connect-interop.sh). Key: advertise our real udx
+        address in the handshake `peerAddress` so the server's OPEN-path connects to our
+        facade socket (our rpc and udx live on separate sockets; hyperdht uses one).
+  - [ ] HOLEPUNCH (holepuncher.js) for non-OPEN/NAT peers — deferred (OPEN/LAN works)
+  - [ ] D server side (accept incoming connects) so two D peers connect
 - [ ] Phase 6: hyperswarm — join(topic)/on(connection), dedup + backoff
-- [ ] Phase 4: dht-rpc
-- [ ] Phase 5: hyperdht (+ holepunch)
 - [ ] Phase 6: hyperswarm
