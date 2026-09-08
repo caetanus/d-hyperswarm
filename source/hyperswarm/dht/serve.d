@@ -67,15 +67,21 @@ final class Server
 {
     private Dht dht;
     private Keypair keyPair;
-    private Address ourUdxAddr;
     void delegate(Connection) nothrow onConnection;
 
     this(Dht dht, Keypair keyPair)
     {
         this.dht = dht;
         this.keyPair = keyPair;
-        this.ourUdxAddr = Address("127.0.0.1", 4, dht.rpc.localPort);
         dht.rpc.onRequest = &onRequest;
+    }
+
+    // The address we advertise: the DHT's view of us (reachable off-box), falling
+    // back to loopback until a node reports it.
+    private Address ourUdxAddr()
+    {
+        auto a = dht.rpc.remoteAddress();
+        return a.host.length ? a : Address("127.0.0.1", 4, dht.rpc.localPort);
     }
 
     /// Announce ourselves under BLAKE2b(publicKey) (an announce-self / "listen"),

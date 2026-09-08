@@ -46,7 +46,14 @@ final class Hyperswarm
     /// until a slot frees; a rejoined discovery re-offers them.
     size_t maxPeers = 64;
     private Server server;
-    private Address ourUdxAddr;
+
+    // The address we advertise for connections: what the DHT reports back to us
+    // (reachable off-box), falling back to loopback until a node has told us.
+    private Address ourUdxAddr()
+    {
+        auto a = dht.rpc.remoteAddress();
+        return a.host.length ? a : Address("127.0.0.1", 4, dht.rpc.localPort);
+    }
 
     private Connection[string] connections; // by remote pubkey hex (de-dup)
     private bool[string] connecting; // in-flight connects (de-dup)
@@ -68,7 +75,6 @@ final class Hyperswarm
         // streams (one socket, like hyperdht) — so the address a server sees our
         // handshake come from is the very socket our stream lives on.
         dht = new Dht(bootstrap);
-        ourUdxAddr = Address("127.0.0.1", 4, dht.rpc.localPort);
 
         // Accept incoming connections (server mode is armed per-topic by join()).
         server = new Server(dht, keyPair);

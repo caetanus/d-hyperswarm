@@ -78,6 +78,12 @@ final class Rpc
     /// with the decoded request and the sender's address. Reply with `send`.
     void delegate(RequestPacket req, Address from) nothrow onRequest;
 
+    // Our own address as other nodes report it (the reply `to` field): a majority
+    // vote across responders, so we advertise a reachable address rather than a
+    // hard-coded loopback. host is empty until we've heard from a node.
+    private uint[string] _selfVotes;
+    private Address _remoteAddr;
+
     // udx may reference a send buffer until the datagram is flushed; keep the last
     // N (req block + payload) alive in a ring. dht-rpc is low volume, so by the time
     // a slot is reused its send is long done.
@@ -120,6 +126,33 @@ final class Rpc
     ushort localPort()
     {
         return _localPort;
+    }
+
+    /// Our address as the network reports it (majority of reply `to` fields), or an
+    /// Address with an empty host if no node has told us yet.
+    Address remoteAddress()
+    {
+        return _remoteAddr;
+    }
+
+    // Fold a responder's view of our address into the running majority vote.
+    private void recordSelf(Address to) nothrow
+    {
+        if (to.host.length == 0 || to.port == 0)
+            return;
+        try
+        {
+            immutable key = format("%s:%d", to.host, to.port);
+            immutable n = (_selfVotes.get(key, 0) + 1);
+            _selfVotes[key] = n;
+            immutable best = _remoteAddr.host.length
+                ? _selfVotes.get(format("%s:%d", _remoteAddr.host, _remoteAddr.port), 0) : 0;
+            if (n >= best)
+                _remoteAddr = to;
+        }
+        catch (Exception)
+        {
+        }
     }
 
     /// The udx instance the rpc socket lives on — the connection layer opens its
@@ -236,6 +269,7 @@ final class Rpc
             auto src = addrFromSockaddr(from);
             if (src.port != p.expectPort || src.host != p.expectHost)
                 return;
+            recordSelf(r.to); // a verified node's view of our address
             p.reply = r;
             p.got = true;
             try
