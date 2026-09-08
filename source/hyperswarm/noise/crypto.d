@@ -12,7 +12,8 @@ import libsodium.crypto_generichash : crypto_generichash, crypto_generichash_ini
 import libsodium.crypto_aead_chacha20poly1305 : crypto_aead_chacha20poly1305_ietf_encrypt,
     crypto_aead_chacha20poly1305_ietf_decrypt;
 import libsodium.crypto_hash_sha512 : crypto_hash_sha512;
-import libsodium.crypto_sign : crypto_sign_seed_keypair, crypto_sign_keypair;
+import libsodium.crypto_sign : crypto_sign_seed_keypair, crypto_sign_keypair,
+    crypto_sign_detached, crypto_sign_verify_detached;
 import libsodium.crypto_scalarmult_ed25519 : crypto_scalarmult_ed25519_noclamp;
 
 enum size_t HASHLEN = 64; // BLAKE2b output
@@ -33,6 +34,31 @@ void blake2b(ref ubyte[HASHLEN] digest, scope const(ubyte)[] data) @trusted
 void keyedBlake2b(scope ubyte[] outp, scope const(ubyte)[] data, scope const(ubyte)[] key) @trusted
 {
     crypto_generichash(outp.ptr, outp.length, data.ptr, data.length, key.ptr, key.length);
+}
+
+/// Multipart BLAKE2b over a sequence of chunks (crypto_generichash_batch), 32-byte
+/// output — used for hyperdht's announce signable.
+void blake2bBatch(scope ubyte[] outp, scope const(ubyte)[][] chunks) @trusted
+{
+    crypto_generichash_state st;
+    crypto_generichash_init(&st, null, 0, outp.length);
+    foreach (ch; chunks)
+        crypto_generichash_update(&st, ch.ptr, ch.length);
+    crypto_generichash_final(&st, outp.ptr, outp.length);
+}
+
+/// Ed25519 detached signature (crypto_sign_detached), 64 bytes.
+void ed25519Sign(ref ubyte[64] sig, scope const(ubyte)[] msg, scope const(ubyte)[] secretKey) @trusted
+in (secretKey.length == SKLEN)
+{
+    crypto_sign_detached(sig.ptr, null, msg.ptr, msg.length, secretKey.ptr);
+}
+
+/// Verify an Ed25519 detached signature.
+bool ed25519Verify(scope const(ubyte)[] sig, scope const(ubyte)[] msg, scope const(ubyte)[] publicKey) @trusted
+in (sig.length == 64 && publicKey.length == PKLEN)
+{
+    return crypto_sign_verify_detached(sig.ptr, msg.ptr, msg.length, publicKey.ptr) == 0;
 }
 
 /// HMAC with BLAKE2b as the hash (noise-handshake/hmac.js): the message is the

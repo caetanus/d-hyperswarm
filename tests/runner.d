@@ -24,5 +24,6 @@ int main(string[] args)
         "tests.secretstream_test",
         "tests.dht_wire_test",
         "tests.dht_table_test",
+        "tests.hdht_messages_test",
     );
 }
