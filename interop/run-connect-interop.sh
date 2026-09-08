@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Phase-5: the connect-by-key HANDSHAKE against a REAL hyperdht server. A hyperdht
-# node listens on a keyPair; the D client finds it via FIND_PEER and runs the Noise
-# IK peer handshake over PEER_HANDSHAKE, deriving the connection keys + the server's
-# address & udx id. Proves the connect handshake is wire-compatible with hyperdht.
+# Phase-5: the FULL connect-by-key against a REAL hyperdht server. A hyperdht node
+# listens on a keyPair; the D client finds it via FIND_PEER, runs the Noise IK peer
+# handshake over PEER_HANDSHAKE, opens a UDX stream to the server and runs the
+# connection secret-stream from the handshake keys — then echoes an encrypted
+# message. Proves the whole connect path is wire-compatible with hyperdht.
 set -u
 cd "$(dirname "$0")/.."
 echo "── building ──"
@@ -20,5 +21,5 @@ echo "  D:  $(grep -vE 'leaking|EventCore|FD ' "$work/d.log" | tail -2 | tr '\n'
 echo "  JS: $(tail -1 "$work/js.log")"
 echo
 if [ $dstatus -eq 0 ] && grep -q '^OK' "$work/d.log"; then
-  echo "PASS  connect-by-key handshake is wire-compatible with hyperdht"; exit 0
+  echo "PASS  full connect-by-key (encrypted stream) is wire-compatible with hyperdht"; exit 0
 else echo "FAIL  connect handshake interop (exit=$dstatus)"; exit 1; fi

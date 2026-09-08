@@ -123,7 +123,6 @@ int main(string[] args)
             auto conn = connectHandshake(dht, pubkey, kp, Address("127.0.0.1", 4, udxPort), ourUdxId);
             writeln("OK connect handshake completed: server=", conn.serverAddress.host, ":",
                 conn.serverAddress.port, " serverUdxId=", conn.serverPayload.udx.id);
-            result = 0; // the handshake milestone; the encrypted stream below needs holepunch
 
             // UDX stream + secret-stream from the handshake keys
             auto stream = new ubyte[](hs_udx_sizeof_stream());
@@ -145,9 +144,12 @@ int main(string[] args)
                 sleep(10.msecs);
 
             if (g_gotEcho)
-                writeln("BONUS: encrypted echo over the UDX stream worked D<->JS!");
+            {
+                writeln("OK encrypted echo over the connect UDX stream worked D<->JS!");
+                result = 0; // the full connect-by-key path is proven end to end
+            }
             else
-                writeln("(encrypted stream pending: server opens its UDX stream via holepunch coordination)");
+                writeln("FAIL encrypted stream did not echo");
             dht.close();
         }
         catch (Exception e) { try writeln("FAIL ", e.msg); catch (Exception) {} }

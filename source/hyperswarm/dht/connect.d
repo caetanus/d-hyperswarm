@@ -1,8 +1,9 @@
 /// The client side of connect-by-key (lib/connect.js + lib/router.js), handshake
 /// step: find the peer via the DHT, run the Noise IK peer handshake through a relay
 /// node with PEER_HANDSHAKE, and derive the connection keys + the server's address
-/// and udx info. Opening the UDX stream + secret-stream (direct, then holepunch) is
-/// the next step.
+/// and udx info. The caller then opens a UDX stream to serverAddress and runs
+/// secret-stream from these keys — for a reachable (OPEN) peer that completes the
+/// connection directly (no holepunch); see interop/dht-connect for the full path.
 module hyperswarm.dht.connect;
 
 import hyperswarm.dht.node : Dht;
@@ -69,6 +70,11 @@ ConnectHandshake connectHandshake(Dht dht, ubyte[32] publicKey, Keypair keyPair,
     Handshake env;
     env.mode = FROM_CLIENT;
     env.noise = msg1;
+    // Our dht-rpc and udx streams live on SEPARATE sockets (hyperdht uses one).
+    // req.from would point the server at our RPC socket; tell it our real udx
+    // address via peerAddress so its OPEN-path connect reaches our facade socket.
+    env.hasPeerAddress = true;
+    env.peerAddress = ourAddress;
     auto reply = dht.rpc.request(Address(relay.host, 4, relay.port), HS_PEER_HANDSHAKE,
         target[], encodeHandshake(env), null, false, per);
 
