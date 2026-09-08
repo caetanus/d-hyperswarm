@@ -58,8 +58,37 @@ ES uses (initiator? e:s local vs rs/re remote) per `keyPattern`.
 - Each subsequent message: `writeUint24le(len, buf)` then
   `encrypt.next(plaintext, buf+3)` — a 3-byte LE length prefix followed by the
   secretstream-encrypted payload (ciphertext = plaintext + ABYTES(17)).
-- Exact header/id framing to be transcribed verbatim from index.js when implementing
-  (IDHEADERBYTES, the 32-byte header subarray, offsets 3/4).
+### Transport, resolved (index.js + sodium-secretstream + hypercore-crypto)
+
+- Every frame on the wire = **uint24-LE length prefix + payload** (writeUint24le).
+- **Handshake phase**: each Noise message is sent as a frame (lib/handshake.js wraps
+  `noise.send()` as `uint24(len) ++ msg`). The receiver de-frames, feeds the bytes to
+  `noise.recv`. Empty prologue, remoteStatic passed to initialise (null for XX).
+- **After the handshake**, one setup frame carries the id + secretstream header:
+  `IDHEADERBYTES = 32 + HEADERBYTES(24) = 56`. Frame = `uint24(56) ++ id(32) ++ header(24)`.
+  - `id = streamId(handshakeHash, isInitiator)`; peer must match
+    `streamId(handshakeHash, !isInitiator)`.
+  - `header` = the tx-key `Push`'s 24-byte secretstream header. Receiver does
+    `Pull.init(header)` with the rx key.
+- **Data messages**: `Push.next(plaintext)` → ciphertext `= plaintext + ABYTES(17)`;
+  frame = `uint24(ciphertext.len) ++ ciphertext`. Receiver: `Pull.next(ciphertext)` →
+  plaintext. (JS uses in-place offset tricks; the D port copies straight.)
+- **secretstream** = `crypto_secretstream_xchacha20poly1305`: `init_push(state, header, txKey)`
+  emits the 24-byte header; `push(state, c, m, ad=null, TAG_MESSAGE)` → c = m+17;
+  `init_pull(state, header, rxKey)`; `pull(state, m, tag, c, ad=null)`. KEYBYTES 32,
+  HEADERBYTES 24, ABYTES 17.
+- **streamId**: `keyed-BLAKE2b(data = NS_role, key = handshakeHash, outlen = 32)` — i.e.
+  `crypto_generichash(out32, in=NS_role, key=handshakeHash)`.
+- **NS constants** (`hypercore-crypto` namespace('hyperswarm/secret-stream', 3), first two):
+  `ns = BLAKE2b("hyperswarm/secret-stream")` (32B); `NS_role = BLAKE2b(ns ++ [roleIndex])`
+  where roleIndex 0 = initiator, 1 = responder. Verified values:
+  - NS_INITIATOR = a931a0155b5c09e6d28628236af83c4b8a6af9af60986edeede9dc5d63192bf7
+  - NS_RESPONDER = 742c9d833d430af4c48a8705e91631eecf295442bbca18996e597097723b1061
+  (Derive them in D via the BLAKE2b construction above rather than hardcoding.)
+
+Design for the port: a **sans-io `SecretStream`** (push framed bytes in → emit decrypted
+messages; write plaintext → produce framed bytes), plus a thin vibe driver for the
+interop. Acceptance: handshake + encrypted echo D⇄JS over TCP vs @hyperswarm/secret-stream.
 
 ## Build order (each verifiable)
 
