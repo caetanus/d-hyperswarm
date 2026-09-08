@@ -13,7 +13,6 @@ import hyperswarm.dht.connect_messages : Handshake, NoisePayload, UdxInfo, FW_OP
 import hyperswarm.dht.messages : HS_FIND_PEER, HS_PEER_HANDSHAKE;
 import hyperswarm.noise.crypto : keyedBlake2b, Keypair;
 import hyperswarm.cenc : Address;
-import std.random : uniform;
 import core.time : Duration, seconds;
 
 // handshake relay modes (lib/router.js)
@@ -32,7 +31,8 @@ struct ConnectHandshake
 /// Run the peer handshake for connect(publicKey): find a relay via FIND_PEER, send a
 /// PEER_HANDSHAKE carrying the IK msg1 + our noisePayload, and complete the handshake
 /// from the server's reply.
-ConnectHandshake connectHandshake(Dht dht, ubyte[32] publicKey, Keypair keyPair, Duration per = 3.seconds)
+ConnectHandshake connectHandshake(Dht dht, ubyte[32] publicKey, Keypair keyPair,
+    Address ourAddress, uint ourUdxId, Duration per = 3.seconds)
 {
     ubyte[32] target;
     keyedBlake2b(target[], publicKey[], []); // target = BLAKE2b(publicKey)
@@ -58,10 +58,9 @@ ConnectHandshake connectHandshake(Dht dht, ubyte[32] publicKey, Keypair keyPair,
 
     // IK handshake (initiator knows the server's static key) carrying our connect info
     auto wrap = new NoiseWrap(keyPair, publicKey[]);
-    immutable ourUdxId = cast(uint) uniform(1, uint.max);
     NoisePayload p;
     p.firewall = FW_OPEN;
-    p.addresses4 = [Address("127.0.0.1", 4, dht.localPort)];
+    p.addresses4 = [ourAddress];
     p.hasUdx = true;
     p.udx = UdxInfo(1, false, ourUdxId, 0);
     p.hasSecretStream = true;
