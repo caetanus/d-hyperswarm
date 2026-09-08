@@ -6,7 +6,7 @@
 module tests.noise_hs_test;
 
 import fluent.asserts;
-import hyperswarm.noise.handshake : NoiseXX;
+import hyperswarm.noise.handshake : Noise, Pattern;
 import hyperswarm.noise.crypto : ed25519Keypair, Keypair;
 import tests.noise_hs_vectors;
 import std.format : format;
@@ -43,8 +43,8 @@ unittest
 {
     auto eI = seedKp(11);
     auto eR = seedKp(12);
-    auto init = new NoiseXX(true, seedKp(1), &eI);
-    auto resp = new NoiseXX(false, seedKp(2), &eR);
+    auto init = new Noise(Pattern.XX, true, seedKp(1), &eI);
+    auto resp = new Noise(Pattern.XX, false, seedKp(2), &eR);
     init.initialise();
     resp.initialise();
 
@@ -82,8 +82,8 @@ unittest
 unittest
 {
     // no fixed ephemerals — exercises the random-keypair path both sides use live
-    auto init = new NoiseXX(true, seedKp(5));
-    auto resp = new NoiseXX(false, seedKp(6));
+    auto init = new Noise(Pattern.XX, true, seedKp(5));
+    auto resp = new Noise(Pattern.XX, false, seedKp(6));
     init.initialise();
     resp.initialise();
 
@@ -95,4 +95,32 @@ unittest
     toHex(init.tx[]).should.equal(toHex(resp.rx[]));
     toHex(init.rx[]).should.equal(toHex(resp.tx[]));
     toHex(init.handshakeHash[]).should.equal(toHex(resp.handshakeHash[]));
+}
+
+@("noise IK: two-message handshake is byte-exact and both sides agree")
+unittest
+{
+    auto sI = seedKp(21), sR = seedKp(22), eI = seedKp(31), eR = seedKp(32);
+    auto init = new Noise(Pattern.IK, true, sI, &eI);
+    auto resp = new Noise(Pattern.IK, false, sR, &eR);
+    init.initialise(null, sR.publicKey[]); // IK initiator knows the responder's static
+    resp.initialise();
+
+    auto m1 = init.send(b("ik1payload"));
+    toHex(m1).should.equal(expect("ik:msg1"));
+    toHex(resp.recv(m1)).should.equal(toHex(b("ik1payload")));
+
+    auto m2 = resp.send(b("ik2payload"));
+    toHex(m2).should.equal(expect("ik:msg2"));
+    toHex(init.recv(m2)).should.equal(toHex(b("ik2payload")));
+
+    init.complete.should.equal(true);
+    resp.complete.should.equal(true);
+    toHex(init.tx[]).should.equal(expect("ik:init-tx"));
+    toHex(init.rx[]).should.equal(expect("ik:init-rx"));
+    toHex(init.handshakeHash[]).should.equal(expect("ik:hash"));
+    toHex(resp.rx[]).should.equal(toHex(init.tx[]));
+    toHex(resp.tx[]).should.equal(toHex(init.rx[]));
+    // the responder learned the initiator's static (IK authenticates both)
+    toHex(resp.remoteStatic[]).should.equal(toHex(sI.publicKey[]));
 }

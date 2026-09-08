@@ -1,16 +1,21 @@
-/// The Noise XX handshake (SymmetricState + the three XX messages), ported from
-/// noise-handshake (pin dc1f9c4) on the Ed25519 curve. Protocol:
-/// Noise_XX_Ed25519_ChaChaPoly_BLAKE2b. This drives secret-stream's mutual
-/// authentication; the wire is asserted byte-for-byte against the reference (with
-/// fixed static + ephemeral keys) in the tests.
+/// The Noise handshake (SymmetricState + the pattern walk) on the Ed25519 curve,
+/// ported from noise-handshake (pin dc1f9c4). Supports the two patterns hyperswarm
+/// uses: XX (secret-stream's mutual handshake) and IK (hyperdht's peer handshake,
+/// where the initiator already knows the responder's static key). Protocol name
+/// Noise_<PATTERN>_Ed25519_ChaChaPoly_BLAKE2b. The wire is asserted byte-for-byte
+/// against the reference (fixed keys) in the tests.
 ///
-/// XX message pattern:
-///   1. →  [e]            2. ←  [e, ee, s, es]            3. →  [s, se]
-/// followed on each message by an encrypted payload. After message 3 both sides
-/// split the chaining key into tx/rx transport keys.
+///   XX: 1. → [e]   2. ← [e,ee,s,es]   3. → [s,se]
+///   IK: (rs preshared)  1. → [e,es,s,ss]   2. ← [e,ee,se]
 module hyperswarm.noise.handshake;
 
 import hyperswarm.noise.crypto;
+
+enum Pattern
+{
+    XX,
+    IK
+}
 
 private enum Tok
 {
@@ -22,16 +27,19 @@ private enum Tok
     SS
 }
 
-// The XX pattern: one token list per message.
-private static immutable Tok[][3] XX = [
+private static immutable Tok[][] XX_MSGS = [
     [Tok.E],
     [Tok.E, Tok.EE, Tok.S, Tok.ES],
     [Tok.S, Tok.SE]
 ];
 
-/// A Noise XX handshake role (initiator or responder). Fold of SymmetricState +
-/// the pattern walk. Not thread-safe; one per connection.
-final class NoiseXX
+private static immutable Tok[][] IK_MSGS = [
+    [Tok.E, Tok.ES, Tok.S, Tok.SS],
+    [Tok.E, Tok.EE, Tok.SE]
+];
+
+/// A Noise handshake role. Not thread-safe; one per connection.
+final class Noise
 {
     private ubyte[HASHLEN] digest;
     private ubyte[HASHLEN] chainingKey;
@@ -40,32 +48,33 @@ final class NoiseXX
     private bool hasKey;
     private uint nonce;
 
+    private Pattern pattern;
     private Keypair s; // our static
     private Keypair e; // our ephemeral
     private bool haveE;
     private ubyte[PKLEN] rs; // remote static
+    private bool haveRs;
     private ubyte[PKLEN] re; // remote ephemeral
 
     private bool initiator;
     private size_t step;
 
-    /// Transport keys, valid once `complete`.
     ubyte[32] tx;
     ubyte[32] rx;
     ubyte[HASHLEN] handshakeHash;
     bool complete;
 
-    /// The peer's authenticated static public key (valid once the S token of the
-    /// handshake has been received). secret-stream uses this as the peer identity.
+    /// The peer's authenticated static public key.
     ubyte[PKLEN] remoteStatic() const @safe nothrow
     {
         return rs;
     }
 
-    /// `staticKp` is our long-term identity. `ephemeral`, when given, fixes the
-    /// ephemeral key (tests); otherwise it is generated on first use.
-    this(bool initiator, Keypair staticKp, Keypair* ephemeral = null) @safe
+    /// `staticKp` is our identity. `ephemeral`, when given, fixes the ephemeral key
+    /// (tests); otherwise it is generated on first use.
+    this(Pattern pattern, bool initiator, Keypair staticKp, Keypair* ephemeral = null) @safe
     {
+        this.pattern = pattern;
         this.initiator = initiator;
         this.s = staticKp;
         if (ephemeral !is null)
@@ -75,21 +84,47 @@ final class NoiseXX
         }
     }
 
-    private enum PROTOCOL = "Noise_XX_Ed25519_ChaChaPoly_BLAKE2b";
-
-    /// Mix in the protocol name and prologue. Must be called before send/recv.
-    void initialise(scope const(ubyte)[] prologue = null) @trusted
+    private const(Tok[][]) msgs() const @safe
     {
-        static assert(PROTOCOL.length <= HASHLEN);
+        return pattern == Pattern.XX ? XX_MSGS : IK_MSGS;
+    }
+
+    private string protocolName() const @safe
+    {
+        return pattern == Pattern.XX
+            ? "Noise_XX_Ed25519_ChaChaPoly_BLAKE2b" : "Noise_IK_Ed25519_ChaChaPoly_BLAKE2b";
+    }
+
+    /// Mix in the protocol name, prologue, and (for IK) the pre-shared responder
+    /// static. `remoteStatic` is required for an IK initiator.
+    void initialise(scope const(ubyte)[] prologue = null, scope const(ubyte)[] remoteStatic = null) @trusted
+    {
+        immutable proto = protocolName();
         digest[] = 0;
-        digest[0 .. PROTOCOL.length] = cast(const(ubyte)[]) PROTOCOL;
+        assert(proto.length <= HASHLEN);
+        digest[0 .. proto.length] = cast(const(ubyte)[]) proto;
         chainingKey[] = digest[];
         mixHash(prologue);
+
+        if (pattern == Pattern.IK)
+        {
+            // preshare RS: the initiator mixes the (known) remote static, the
+            // responder mixes its own static.
+            if (initiator)
+            {
+                assert(remoteStatic.length == PKLEN, "IK initiator needs the remote static key");
+                rs[] = remoteStatic[0 .. PKLEN];
+                haveRs = true;
+                mixHash(rs[]);
+            }
+            else
+                mixHash(s.publicKey[]);
+        }
     }
 
     private void mixHash(scope const(ubyte)[] data) @trusted
     {
-        ubyte[] tmp = new ubyte[](HASHLEN + data.length);
+        auto tmp = new ubyte[](HASHLEN + data.length);
         tmp[0 .. HASHLEN] = digest[];
         tmp[HASHLEN .. $] = data[];
         blake2b(digest, tmp);
@@ -150,7 +185,6 @@ final class NoiseXX
         complete = true;
     }
 
-    // local key for a DH token: static (s) or ephemeral (e)
     private void mixKeyToken(Tok t) @trusted
     {
         bool useLocalStatic, useRemoteStatic;
@@ -182,7 +216,7 @@ final class NoiseXX
     ubyte[] send(scope const(ubyte)[] payload = null) @trusted
     {
         ubyte[] outp;
-        foreach (t; XX[step])
+        foreach (t; msgs[step])
         {
             final switch (t)
             {
@@ -208,7 +242,7 @@ final class NoiseXX
         }
         outp ~= encryptAndHash(payload);
         step++;
-        if (step == XX.length)
+        if (step == msgs.length)
             split();
         return outp;
     }
@@ -226,7 +260,7 @@ final class NoiseXX
             return r;
         }
 
-        foreach (t; XX[step])
+        foreach (t; msgs[step])
         {
             final switch (t)
             {
@@ -237,6 +271,7 @@ final class NoiseXX
             case Tok.S:
                 immutable klen = hasKey ? PKLEN + MACBYTES : PKLEN;
                 rs[] = decryptAndHash(shift(klen));
+                haveRs = true;
                 break;
             case Tok.EE:
             case Tok.ES:
@@ -248,8 +283,14 @@ final class NoiseXX
         }
         auto payload = decryptAndHash(buf[off .. $]);
         step++;
-        if (step == XX.length)
+        if (step == msgs.length)
             split();
         return payload;
     }
+}
+
+/// XX convenience (secret-stream): a mutual handshake with no pre-shared key.
+Noise noiseXX(bool initiator, Keypair staticKp, Keypair* ephemeral = null) @safe
+{
+    return new Noise(Pattern.XX, initiator, staticKp, ephemeral);
 }

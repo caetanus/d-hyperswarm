@@ -10,7 +10,7 @@
 module hyperswarm.noise.stream;
 
 import hyperswarm.noise.crypto : Keypair, keyedBlake2b;
-import hyperswarm.noise.handshake : NoiseXX;
+import hyperswarm.noise.handshake : Noise, noiseXX;
 import hyperswarm.noise.secretstream : Push, Pull, HEADERBYTES;
 
 private enum size_t IDBYTES = 32;
@@ -52,7 +52,7 @@ struct IoResult
 
 final class SecretStream
 {
-    private NoiseXX hs;
+    private Noise hs;
     private bool isInitiator;
     private ubyte[] inbuf;
 
@@ -68,7 +68,7 @@ final class SecretStream
     this(bool isInitiator, Keypair staticKp) @safe
     {
         this.isInitiator = isInitiator;
-        this.hs = new NoiseXX(isInitiator, staticKp);
+        this.hs = noiseXX(isInitiator, staticKp);
     }
 
     /// The peer's authenticated static public key (valid once opened).
