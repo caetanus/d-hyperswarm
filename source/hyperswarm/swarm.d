@@ -42,6 +42,9 @@ final class Hyperswarm
 {
     Keypair keyPair;
     Dht dht;
+    /// Cap on concurrent connections (client + server). Further peers are ignored
+    /// until a slot frees; a rejoined discovery re-offers them.
+    size_t maxPeers = 64;
     private Server server;
     private Address ourUdxAddr;
 
@@ -76,9 +79,10 @@ final class Hyperswarm
     private void adoptConnection(Connection c) nothrow
     {
         immutable hex = toHex(c.remotePublicKey[]);
-        if ((hex in connections) !is null)
+        if ((hex in connections) !is null || connections.length >= maxPeers)
             return;
         connections[hex] = c;
+        c.onClose = () nothrow { connections.remove(hex); };
         if (onConnection !is null)
             onConnection(c);
     }
@@ -165,6 +169,8 @@ final class Hyperswarm
         immutable hex = toHex(pubkey[]);
         if ((hex in connections) !is null || (hex in connecting) !is null)
             return;
+        if (connections.length + connecting.length >= maxPeers)
+            return; // at the connection cap; a later discovery re-offers this peer
         if (onDiscover !is null)
             onDiscover(pubkey);
         connecting[hex] = true;
@@ -188,6 +194,8 @@ final class Hyperswarm
             if (!conn.opened)
                 return;
             connections[hex] = conn;
+            // On close, free the slot so a later discovery can reconnect this peer.
+            conn.onClose = () nothrow { connections.remove(hex); };
             if (onConnection !is null)
                 onConnection(conn);
         }

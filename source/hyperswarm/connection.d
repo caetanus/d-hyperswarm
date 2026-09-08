@@ -27,7 +27,13 @@ extern (C) void hsConnRead(void* stream, ptrdiff_t len, const(uv_buf_t)* buf) no
 
 extern (C) void hsConnClose(void* stream, int status) nothrow
 {
-    g_conns.remove(stream);
+    if (auto c = stream in g_conns)
+    {
+        auto conn = *c;
+        g_conns.remove(stream);
+        if (conn.onClose !is null)
+            conn.onClose();
+    }
 }
 
 extern (C) void hsConnFinalize(void* stream) nothrow {}
@@ -44,6 +50,8 @@ final class Connection
     void delegate(ubyte[]) nothrow onData;
     /// Delegate invoked once, when the secret-stream finishes opening.
     void delegate() nothrow onOpen;
+    /// Delegate invoked when the underlying UDX stream closes.
+    void delegate() nothrow onClose;
 
     this(void* udx, void* stream, SecretStream ss, ubyte[32] remotePublicKey) nothrow
     {
