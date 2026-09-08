@@ -61,7 +61,7 @@ final class Dht
     /// Iterative query toward `target` with `command` (internal=true for the
     /// built-in FIND_NODE routing, false for hyperdht LOOKUP/ANNOUNCE). Returns the
     /// responded nodes (with token + value) closest first.
-    private QReply[] iterativeQuery(ubyte[32] target, uint command, scope const(ubyte)[] value,
+    QReply[] query(ubyte[32] target, uint command, scope const(ubyte)[] value,
         bool internal, int k, Duration per)
     {
         Node[string] nodes;
@@ -143,7 +143,7 @@ final class Dht
     Node[] findNode(ubyte[32] target, int k = 20, Duration per = 2.seconds)
     {
         Node[] outp;
-        foreach (q; iterativeQuery(target, FIND_NODE, null, true, k, per))
+        foreach (q; query(target, FIND_NODE, null, true, k, per))
             outp ~= q.from;
         return outp;
     }
@@ -153,7 +153,7 @@ final class Dht
     {
         PeerRecord[] peers;
         bool[string] seenPk;
-        foreach (q; iterativeQuery(topic, HS_LOOKUP, null, false, k, per))
+        foreach (q; query(topic, HS_LOOKUP, null, false, k, per))
         {
             if (q.value.length == 0)
                 continue;
@@ -177,7 +177,7 @@ final class Dht
         Duration per = 2.seconds)
     {
         int committed;
-        foreach (q; iterativeQuery(topic, HS_LOOKUP, null, false, k, per))
+        foreach (q; query(topic, HS_LOOKUP, null, false, k, per))
         {
             if (q.token.length != 32)
                 continue;

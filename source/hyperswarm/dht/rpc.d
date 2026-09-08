@@ -92,7 +92,9 @@ final class Rpc
                 continue;
             Reply r;
             try
-                r = decodeReply(got);
+                // dup: decoded fields slice into the packet, and `buf` is reused by
+                // the next recv — the reply must own its bytes past this iteration.
+                r = decodeReply(got.dup);
             catch (Exception)
                 continue;
             if (auto pp = r.tid in pending)

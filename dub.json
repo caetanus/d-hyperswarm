@@ -47,6 +47,14 @@
 			]
 		},
 		{
+			"name": "dht-connect-peer",
+			"targetType": "executable",
+			"targetName": "dht-connect-peer",
+			"mainSourceFile": "interop/dht-connect/app.d",
+			"sourcePaths": ["source", "interop/dht-connect"],
+			"importPaths": ["source", "interop/dht-connect"]
+		},
+		{
 			"name": "dht-announce-peer",
 			"targetType": "executable",
 			"targetName": "dht-announce-peer",
