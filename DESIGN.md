@@ -85,6 +85,15 @@ Isolated local DHT for unit tests: bootstrap `[]`.
 
 ## Status
 
+**Core complete (2026-09-08):** the full stack (phases 1–6) is wire-compatible with
+the real Holepunch network and interop-validated in every direction for
+reachable/OPEN peers — 11 interop suites (connect both ways, hyperswarm both ways,
+D↔D, live DHT lookup, announce, udx, secret-stream) + 14 unit modules, and it has
+survived an adversarial Codex review (10 lifecycle/leak/DoS/spoofing bugs fixed).
+The one remaining feature — cross-NAT **holepunch** (message wire done; the punch
+itself) — needs a real two-NAT environment to build and validate, so it is not
+attempted blind.
+
 - [x] Phase 1: compact-encoding port + byte-exact vectors (16 tests, 0 failed)
 - [ ] Phase 2: UDX via the libuv→vibe facade (decided facade over laundering, 2026-09-07)
   - [x] libudx vendored (`vendor/libudx`, pin 01d6630)
