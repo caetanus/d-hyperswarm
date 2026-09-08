@@ -10,6 +10,7 @@ module hyperswarm.swarm;
 
 import hyperswarm.dht.node : Dht;
 import hyperswarm.dht.connect : connectHandshake;
+import hyperswarm.dht.serve : Server;
 import hyperswarm.connection : Connection, hsConnRead, hsConnClose, hsConnFinalize;
 import hyperswarm.udx.udx;
 import hyperswarm.udx.facade : uv_buf_t;
@@ -41,6 +42,7 @@ final class Hyperswarm
 {
     Keypair keyPair;
     Dht dht;
+    private Server server;
     private Address ourUdxAddr;
 
     private Connection[string] connections; // by remote pubkey hex (de-dup)
@@ -64,18 +66,48 @@ final class Hyperswarm
         // handshake come from is the very socket our stream lives on.
         dht = new Dht(bootstrap);
         ourUdxAddr = Address("127.0.0.1", 4, dht.rpc.localPort);
+
+        // Accept incoming connections (server mode is armed per-topic by join()).
+        server = new Server(dht, keyPair);
+        server.onConnection = (Connection c) nothrow { adoptConnection(c); };
     }
 
-    /// Start discovering and connecting to the peers sharing `topic` (client
-    /// mode). Server mode (announce + accept) is not implemented yet.
-    void join(ubyte[32] topic, bool client = true, bool server = false)
+    // De-dup a server-accepted connection against the client-side map and emit it.
+    private void adoptConnection(Connection c) nothrow
+    {
+        immutable hex = toHex(c.remotePublicKey[]);
+        if ((hex in connections) !is null)
+            return;
+        connections[hex] = c;
+        if (onConnection !is null)
+            onConnection(c);
+    }
+
+    /// Join `topic`: in client mode, discover and connect to its peers; in server
+    /// mode, announce the topic and ourselves (listen) so peers can find + reach us,
+    /// accepting their connections. Both emit onConnection (de-duplicated).
+    void join(ubyte[32] topic, bool client = true, bool serverMode = false)
     {
         if (destroyed)
             return;
         immutable hex = toHex(topic[]);
-        if (hex in topics)
-            return;
-        if (client)
+        if (serverMode)
+        {
+            auto t = topic;
+            // announce the topic (so a lookup finds us) + announce-self (so the
+            // connect handshake can be routed to us), then keep serving.
+            runTask(() nothrow {
+                try
+                {
+                    server.listen(); // announce-self under BLAKE2b(publicKey)
+                    dht.announce(t, keyPair, [ourUdxAddr]); // topic record
+                }
+                catch (Exception)
+                {
+                }
+            });
+        }
+        if (client && (hex in topics) is null)
         {
             topics[hex] = true;
             auto t = topic;
