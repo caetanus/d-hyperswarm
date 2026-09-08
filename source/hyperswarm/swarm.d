@@ -75,12 +75,18 @@ final class Hyperswarm
         server.onConnection = (Connection c) nothrow { adoptConnection(c); };
     }
 
-    // De-dup a server-accepted connection against the client-side map and emit it.
+    // De-dup a server-accepted connection against the client-side map (and any
+    // in-flight outbound to the same peer) and emit it; otherwise tear it down so a
+    // rejected connection doesn't linger.
     private void adoptConnection(Connection c) nothrow
     {
         immutable hex = toHex(c.remotePublicKey[]);
-        if ((hex in connections) !is null || connections.length >= maxPeers)
+        if ((hex in connections) !is null || (hex in connecting) !is null
+            || connections.length >= maxPeers)
+        {
+            c.destroy();
             return;
+        }
         connections[hex] = c;
         c.onClose = () nothrow { connections.remove(hex); };
         if (onConnection !is null)
@@ -128,6 +134,11 @@ final class Hyperswarm
     void close()
     {
         destroyed = true;
+        // Destroy live connections first: libudx refuses to close a socket that
+        // still owns streams, so closing the dht socket before this would leak it.
+        foreach (c; connections.values)
+            c.destroy();
+        connections = null;
         try
             dht.close();
         catch (Exception)
@@ -192,7 +203,15 @@ final class Hyperswarm
             for (int i = 0; i < 300 && !conn.opened; i++)
                 sleep(10.msecs);
             if (!conn.opened)
+            {
+                conn.destroy(); // gave up: tear the stream down, don't leak it
                 return;
+            }
+            if ((hex in connections) !is null)
+            {
+                conn.destroy(); // an inbound connection to this peer won the race
+                return;
+            }
             connections[hex] = conn;
             // On close, free the slot so a later discovery can reconnect this peer.
             conn.onClose = () nothrow { connections.remove(hex); };

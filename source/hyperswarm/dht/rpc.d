@@ -18,7 +18,7 @@ import hyperswarm.udx.udx;
 import hyperswarm.udx.facade : Loop, uv_buf_t;
 import vibe.core.sync : LocalManualEvent, createManualEvent;
 import vibe.core.core : runTask;
-import vibe.core.net : resolveHost;
+import vibe.core.net : resolveHost, NetworkAddress;
 import core.time : Duration, seconds;
 import core.sys.posix.sys.socket : sockaddr, sockaddr_storage, AF_INET;
 import core.sys.posix.netinet.in_ : sockaddr_in;
@@ -68,6 +68,8 @@ final class Rpc
         LocalManualEvent ev;
         Reply reply;
         bool got;
+        string expectHost; // resolved IP we sent to; a reply must come from it
+        ushort expectPort;
     }
 
     private Pending[ushort] pending;
@@ -97,11 +99,17 @@ final class Rpc
         b.sin_family = AF_INET;
         b.sin_addr.s_addr = 0; // INADDR_ANY
         b.sin_port = htons(bindPort);
-        hs_udx_socket_bind(sock.ptr, cast(sockaddr*)&b, 0);
+        // Fail loudly rather than returning a zombie that only ever times out (e.g.
+        // the port is in use).
+        if (hs_udx_socket_bind(sock.ptr, cast(sockaddr*)&b, 0) != 0)
+            throw new Exception("dht-rpc: udx socket bind failed");
         sockaddr_storage ss;
         int sl = cast(int) ss.sizeof;
-        hs_udx_socket_getsockname(sock.ptr, &ss, &sl);
+        if (hs_udx_socket_getsockname(sock.ptr, &ss, &sl) != 0)
+            throw new Exception("dht-rpc: getsockname failed");
         _localPort = ntohs((cast(sockaddr_in*)&ss).sin_port);
+        if (_localPort == 0)
+            throw new Exception("dht-rpc: bound to port 0");
 
         sendKeep.length = SEND_RING;
         g_rpcBySock[sock.ptr] = this;
@@ -157,22 +165,23 @@ final class Rpc
 
         auto req = encodeRequest(tid, to, command, target, value, token, null, internal);
 
+        // Resolve once; remember the resolved IP+port so a forged reply from some
+        // other source with a guessed tid can't wake this request.
+        auto na = resolveHost(to.host);
+        na.port = to.port;
+        p.expectHost = na.toAddressString();
+        p.expectPort = to.port;
+
         immutable cnt = p.ev.emitCount;
-        sendDatagram(req, to);
+        sendResolved(req, na);
         p.ev.wait(timeout, cnt);
         if (!p.got)
             throw new Exception("dht: request timed out");
         return p.reply;
     }
 
-    private void sendDatagram(ubyte[] data, Address to)
+    private void sendResolved(ubyte[] data, NetworkAddress na)
     {
-        // resolveHost handles both dotted-quad IPs (immediate) and hostnames (the
-        // live bootstrap is node{1,2,3}.hyperdht.org). udx copies the addr into the
-        // send req, so a transient NetworkAddress is fine.
-        auto na = resolveHost(to.host);
-        na.port = to.port;
-
         auto sreq = new ubyte[](hs_udx_sizeof_socket_send());
         // keep the request block + payload alive past this call (udx references the
         // buffer until the datagram is flushed).
@@ -184,10 +193,14 @@ final class Rpc
         hs_udx_socket_send(sreq.ptr, sock.ptr, &b, 1, cast(const(void)*) na.sockAddr, null);
     }
 
-    /// Send a raw datagram to `to` (used to reply to a request).
+    /// Send a raw datagram to `to` (used to reply to a request). resolveHost handles
+    /// both dotted-quad IPs (immediate) and hostnames (the live bootstrap is
+    /// node{1,2,3}.hyperdht.org).
     void send(Address to, ubyte[] datagram)
     {
-        sendDatagram(datagram, to);
+        auto na = resolveHost(to.host);
+        na.port = to.port;
+        sendResolved(datagram, na);
     }
 
     // Called from the udx socket recv callback with one datagram.
@@ -219,6 +232,10 @@ final class Rpc
         if (auto pp = r.tid in pending)
         {
             auto p = *pp;
+            // Drop a reply whose source isn't the node we sent this tid to.
+            auto src = addrFromSockaddr(from);
+            if (src.port != p.expectPort || src.host != p.expectHost)
+                return;
             p.reply = r;
             p.got = true;
             try

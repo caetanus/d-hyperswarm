@@ -3,18 +3,19 @@
 /// keys (SecretStream.fromHandshake); this wraps the two so callers see a plain
 /// send/receive of decrypted application bytes.
 ///
-/// The udx read callback is a C-ABI function that only gets the stream pointer,
-/// so we keep a process-wide registry from stream pointer to Connection. This is
-/// safe without locking: the facade loop and every callback run on one vibe
-/// thread cooperatively (a C callback never yields), so the map is only touched
-/// between yield points.
+/// The udx read/ack callbacks are C-ABI functions that only get a pointer, so we
+/// keep process-wide registries from stream/request pointer to the owning
+/// Connection. This is safe without locking as long as a given udx socket is driven
+/// by a single vibe thread (a C callback never yields); the maps are keyed by
+/// distinct heap pointers, so independent instances don't collide.
 module hyperswarm.connection;
 
 import hyperswarm.udx.udx;
 import hyperswarm.udx.facade : uv_buf_t;
 import hyperswarm.noise.stream : SecretStream;
 
-private __gshared Connection[void*] g_conns;
+private __gshared Connection[void*] g_conns; // stream ptr -> Connection
+private __gshared Connection[void*] g_writeOwner; // write-req ptr -> Connection
 
 /// The udx read callback: route decrypted-stream input to the owning Connection.
 extern (C) void hsConnRead(void* stream, ptrdiff_t len, const(uv_buf_t)* buf) nothrow
@@ -25,12 +26,27 @@ extern (C) void hsConnRead(void* stream, ptrdiff_t len, const(uv_buf_t)* buf) no
         c.onReadRaw(cast(ubyte[]) buf.base[0 .. len]);
 }
 
+/// The udx write-ack callback: the datagram is sent, so release its held buffers.
+extern (C) void hsConnAck(void* req, int status, int unordered) nothrow
+{
+    if (auto c = req in g_writeOwner)
+    {
+        c.pending.remove(req);
+        g_writeOwner.remove(req);
+    }
+}
+
 extern (C) void hsConnClose(void* stream, int status) nothrow
 {
     if (auto c = stream in g_conns)
     {
         auto conn = *c;
+        conn.closed = true;
         g_conns.remove(stream);
+        // release any still-inflight write buffers for this connection
+        foreach (req; conn.pending.keys)
+            g_writeOwner.remove(req);
+        conn.pending = null;
         if (conn.onClose !is null)
             conn.onClose();
     }
@@ -44,8 +60,12 @@ final class Connection
     private void* stream; // opaque udx_stream block pointer
     private SecretStream ss;
     ubyte[32] remotePublicKey;
-    private ubyte[][] keep; // write bufs/reqs kept alive until acked
+    // In-flight writes: request-block ptr -> [request block, payload], kept alive
+    // until udx acks (hsConnAck), so a long-lived connection doesn't accumulate
+    // every byte it ever sent.
+    private ubyte[][][void*] pending;
     bool opened;
+    bool closed;
     /// Delegate invoked with each decrypted application message.
     void delegate(ubyte[]) nothrow onData;
     /// Delegate invoked once, when the secret-stream finishes opening.
@@ -62,19 +82,33 @@ final class Connection
         g_conns[stream] = this;
     }
 
+    /// Tear the connection down (destroys the UDX stream; the close callback then
+    /// clears the registries and fires onClose).
+    void destroy() nothrow
+    {
+        if (closed)
+            return;
+        closed = true;
+        try
+            hs_udx_stream_destroy(stream);
+        catch (Exception)
+        {
+        }
+    }
+
     /// Frame + send raw secret-stream bytes over the UDX stream.
     private void writeRaw(ubyte[] data) nothrow
     {
-        if (data.length == 0)
+        if (closed || data.length == 0)
             return;
         try
         {
             auto req = new ubyte[](hs_udx_stream_write_sizeof(1));
             auto d = data.dup;
-            keep ~= req;
-            keep ~= d;
+            pending[req.ptr] = [req, d];
+            g_writeOwner[req.ptr] = this;
             auto b = uv_buf_t(cast(char*) d.ptr, d.length);
-            hs_udx_stream_write(req.ptr, stream, &b, 1, null);
+            hs_udx_stream_write(req.ptr, stream, &b, 1, &hsConnAck);
         }
         catch (Exception)
         {
@@ -84,6 +118,8 @@ final class Connection
     /// Emit the secret-stream setup frame (call once after connecting).
     void start() nothrow
     {
+        if (closed)
+            return;
         try
             writeRaw(ss.start());
         catch (Exception)
@@ -94,6 +130,8 @@ final class Connection
     /// Send encrypted application data to the peer.
     void write(scope const(ubyte)[] data) nothrow
     {
+        if (closed)
+            return;
         try
             writeRaw(ss.write(data));
         catch (Exception)
@@ -104,6 +142,8 @@ final class Connection
     // Called from the C read callback with raw stream bytes.
     package void onReadRaw(ubyte[] raw) nothrow
     {
+        if (closed)
+            return;
         try
         {
             auto r = ss.feed(raw);

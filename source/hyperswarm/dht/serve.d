@@ -20,7 +20,14 @@ import hyperswarm.udx.udx;
 import hyperswarm.noise.stream : SecretStream;
 import hyperswarm.noise.crypto : Keypair, keyedBlake2b;
 import hyperswarm.cenc : Address;
+import vibe.core.core : runTask, sleep;
+import core.time : seconds;
 import std.random : uniform;
+
+// Cap on half-open (handshaked but not yet SYN'd) incoming streams, and how long
+// one may sit before we tear it down — bounds a flood of handshakes with no SYN.
+private enum size_t MAX_PENDING = 512;
+private enum HANDSHAKE_WAIT = 10;
 
 // handshake relay modes (lib/router.js)
 private enum uint FROM_CLIENT = 0;
@@ -46,8 +53,11 @@ extern (C) int hsServerFirewall(void* stream, void* socket, const(void)* from) n
     auto inc = stream in g_incoming;
     if (inc is null)
         return 1; // reject: not a stream we're expecting
-    hs_udx_stream_connect(stream, socket, inc.clientUdxId, from);
-    inc.conn.start(); // our secret-stream setup frame
+    immutable clientUdxId = inc.clientUdxId;
+    auto conn = inc.conn;
+    g_incoming.remove(stream); // connected now — no longer a pending accept
+    hs_udx_stream_connect(stream, socket, clientUdxId, from);
+    conn.start(); // our secret-stream setup frame
     return 0; // accept
 }
 
@@ -94,6 +104,8 @@ final class Server
         auto env = decodeHandshake(req.value);
         if (env.noise.length == 0)
             return;
+        if (g_incoming.length >= MAX_PENDING)
+            return; // too many half-open handshakes waiting for a SYN — drop this
 
         // IK responder: consume the client's msg1 (+ its noisePayload), send msg2.
         auto wrap = new NoiseWrap(keyPair, null);
@@ -124,6 +136,22 @@ final class Server
                 cb(conn);
         };
         g_incoming[stream.ptr] = Incoming(clientPayload.udx.id, conn);
+
+        // If the client never sends its SYN, tear the half-open stream down so a
+        // flood of handshakes can't pin streams + state forever.
+        auto sp = stream.ptr;
+        runTask(() nothrow {
+            try
+                sleep(HANDSHAKE_WAIT.seconds);
+            catch (Exception)
+            {
+            }
+            if ((sp in g_incoming) !is null)
+            {
+                g_incoming.remove(sp);
+                conn.destroy();
+            }
+        });
 
         // Send msg2 back the way the request came. A direct FROM_CLIENT connect gets
         // a plain REPLY. A relayed FROM_RELAY connect is relayed onward as a

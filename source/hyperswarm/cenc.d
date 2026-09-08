@@ -407,9 +407,13 @@ template ArrayOf(Elem)
             immutable len = cast(size_t)Uint.decode(s);
             if (len > 0x100000)
                 throw new Exception("Array is too big");
-            auto arr = new T[](len);
+            // Don't preallocate `len`: a tiny datagram can claim ~1M elements. Append
+            // as we decode, so a bogus count fails fast on the first missing element
+            // (Elem.decode throws out-of-bounds) instead of allocating megabytes.
+            T[] arr;
+            arr.reserve(len < 4096 ? len : 4096);
             foreach (i; 0 .. len)
-                arr[i] = Elem.decode(s);
+                arr ~= Elem.decode(s);
             return arr;
         }
     }
