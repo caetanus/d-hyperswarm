@@ -47,6 +47,14 @@
 			]
 		},
 		{
+			"name": "dht-announce-peer",
+			"targetType": "executable",
+			"targetName": "dht-announce-peer",
+			"mainSourceFile": "interop/dht-announce/app.d",
+			"sourcePaths": ["source", "interop/dht-announce"],
+			"importPaths": ["source", "interop/dht-announce"]
+		},
+		{
 			"name": "dht-lookup-peer",
 			"targetType": "executable",
 			"targetName": "dht-lookup-peer",

@@ -7,6 +7,23 @@ module hyperswarm.dht.messages;
 import hyperswarm.cenc : State, Uint, Fixed, ArrayOf, Ipv4Address, Address;
 import hyperswarm.noise.crypto : keyedBlake2b, blake2bBatch, ed25519Sign, ed25519Verify, Keypair;
 
+/// hyperdht command ids (lib/constants.js COMMANDS). These are EXTERNAL commands
+/// (the dht-rpc `internal` flag is NOT set), so their numbers may coincide with
+/// dht-rpc's internal commands — the flag disambiguates.
+enum : uint
+{
+    HS_PEER_HANDSHAKE = 0,
+    HS_PEER_HOLEPUNCH = 1,
+    HS_FIND_PEER = 2,
+    HS_LOOKUP = 3,
+    HS_ANNOUNCE = 4,
+    HS_UNANNOUNCE = 5,
+    HS_MUTABLE_PUT = 6,
+    HS_MUTABLE_GET = 7,
+    HS_IMMUTABLE_PUT = 8,
+    HS_IMMUTABLE_GET = 9
+}
+
 private alias Fixed32 = Fixed!32;
 private alias Fixed64 = Fixed!64;
 private alias Ipv4Array = ArrayOf!Ipv4Address;

@@ -48,9 +48,13 @@ final class Rpc
         }
     }
 
-    /// Send `command` to `to` and wait for the reply (throws on timeout).
+    /// Send `command` to `to` and wait for the reply (throws on timeout). `internal`
+    /// marks a built-in dht-rpc command (FIND_NODE, PING); hyperdht commands
+    /// (LOOKUP, ANNOUNCE, PEER_HANDSHAKE) are external — pass internal=false and, when
+    /// committing, the token from that node's earlier reply.
     Reply request(Address to, uint command, scope const(ubyte)[] target = null,
-        scope const(ubyte)[] value = null, Duration timeout = 2.seconds)
+        scope const(ubyte)[] value = null, scope const(ubyte)[] token = null,
+        bool internal = true, Duration timeout = 2.seconds)
     {
         immutable tid = nextTid++;
         if (nextTid == 0)
@@ -62,7 +66,7 @@ final class Rpc
         scope (exit)
             pending.remove(tid);
 
-        auto req = encodeRequest(tid, to, command, target, value);
+        auto req = encodeRequest(tid, to, command, target, value, token, null, internal);
         auto dst = resolveHost(to.host);
         dst.port = to.port;
 

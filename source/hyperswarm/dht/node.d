@@ -1,20 +1,21 @@
-/// A minimal DHT node: bootstrap + the iterative Kademlia lookup (findNode) that
-/// hyperdht's announce/lookup/connect ride on. findNode walks toward a target,
-/// querying the closest unqueried nodes with FIND_NODE and folding in the
-/// closerNodes each returns, until the k closest have answered.
-///
-/// The FIND_NODE wire is byte-exact (validated separately); the lookup is an
-/// algorithm over it — the network's replies decide the result, not our pacing —
-/// so it interoperates with the real DHT.
+/// A minimal DHT node: bootstrap + an iterative Kademlia query, and the hyperdht
+/// discovery operations built on it — findNode (routing), lookup(topic) and
+/// announce(topic). The FIND_NODE / LOOKUP / ANNOUNCE wire is byte-exact; the query
+/// is an algorithm over it (the network's replies decide the result), so it
+/// interoperates with the real DHT.
 module hyperswarm.dht.node;
 
 import hyperswarm.dht.rpc : Rpc;
 import hyperswarm.dht.wire : FIND_NODE, nodeId, Reply;
 import hyperswarm.dht.table : RoutingTable, Node, compareDistance;
+import hyperswarm.dht.messages : PeerRecord, Announce, encodeAnnounce, signAnnounce,
+    decodeLookupReply, HS_LOOKUP, HS_ANNOUNCE;
+import hyperswarm.noise.crypto : Keypair;
 import hyperswarm.cenc : Address;
 import std.algorithm : sort, min;
 import std.conv : to;
-import core.time : Duration, seconds, msecs;
+import std.format : format;
+import core.time : Duration, seconds;
 
 final class Dht
 {
@@ -25,11 +26,9 @@ final class Dht
 
     this(Address[] bootstrap, ushort bindPort = 0)
     {
-        this.rpc = new Rpc(bindPort);
-        // an ephemeral client id; only affects our own bucket layout, not the
-        // XOR ordering of a lookup (which is relative to the target).
         import std.random : uniform;
 
+        this.rpc = new Rpc(bindPort);
         foreach (ref b; id)
             b = cast(ubyte) uniform(0, 256);
         this.table = new RoutingTable(id);
@@ -41,18 +40,33 @@ final class Dht
         rpc.close();
     }
 
+    ushort localPort()
+    {
+        return rpc.localPort;
+    }
+
     private static string addrKey(Node n)
     {
         return n.host ~ ":" ~ n.port.to!string;
     }
 
-    /// Iterative FIND_NODE toward `target`; returns up to k responding nodes,
-    /// closest first.
-    Node[] findNode(ubyte[32] target, int k = 20, Duration perRequest = 2.seconds)
+    /// A responded query node with its token and reply value.
+    struct QReply
+    {
+        Node from;
+        ubyte[] token;
+        ubyte[] value;
+    }
+
+    /// Iterative query toward `target` with `command` (internal=true for the
+    /// built-in FIND_NODE routing, false for hyperdht LOOKUP/ANNOUNCE). Returns the
+    /// responded nodes (with token + value) closest first.
+    private QReply[] iterativeQuery(ubyte[32] target, uint command, scope const(ubyte)[] value,
+        bool internal, int k, Duration per)
     {
         Node[string] nodes;
         bool[string] queried;
-        bool[string] responded;
+        QReply[string] replies;
 
         void add(Node n)
         {
@@ -72,19 +86,17 @@ final class Dht
         foreach (n; table.closest(target[], k))
             add(n);
 
-        Node[] respondedSorted()
+        QReply[] respondedSorted()
         {
-            Node[] r;
-            foreach (key, ref n; nodes)
-                if (key in responded)
-                    r ~= n;
-            sort!((a, b) => compareDistance(a.id[], b.id[], target[]) < 0)(r);
+            QReply[] r;
+            foreach (key, ref q; replies)
+                r ~= q;
+            sort!((a, b) => compareDistance(a.from.id[], b.from.id[], target[]) < 0)(r);
             return r;
         }
 
-        foreach (_; 0 .. 60)
+        foreach (_; 0 .. 80)
         {
-            // closest unqueried node
             string best;
             foreach (key, ref n; nodes)
             {
@@ -96,20 +108,23 @@ final class Dht
             if (best is null)
                 break;
 
-            // converged: the closest unqueried is no nearer than the k-th responder
             auto resp = respondedSorted();
-            if (resp.length >= k && compareDistance(nodes[best].id[], resp[k - 1].id[], target[]) > 0)
+            if (resp.length >= k && compareDistance(nodes[best].id[], resp[k - 1].from.id[], target[]) > 0)
                 break;
 
             queried[best] = true;
             auto n = nodes[best];
             Reply rep;
             try
-                rep = rpc.request(Address(n.host, 4, n.port), FIND_NODE, target[], null, perRequest);
+                rep = rpc.request(Address(n.host, 4, n.port), command, target[], value, null, internal, per);
             catch (Exception)
-                continue; // timed out / unreachable
-            responded[best] = true;
+                continue;
             table.add(n);
+            // use the node's self-reported id (what it signs/verifies announces
+            // against) when present, else the id derived from its address.
+            if (rep.id.length == 32)
+                n.id[] = rep.id[];
+            replies[best] = QReply(n, rep.token, rep.value);
             foreach (cn; rep.closerNodes)
             {
                 Node m;
@@ -122,5 +137,69 @@ final class Dht
 
         auto result = respondedSorted();
         return result[0 .. min(k, result.length)];
+    }
+
+    /// Iterative FIND_NODE: the k closest responding nodes to `target`.
+    Node[] findNode(ubyte[32] target, int k = 20, Duration per = 2.seconds)
+    {
+        Node[] outp;
+        foreach (q; iterativeQuery(target, FIND_NODE, null, true, k, per))
+            outp ~= q.from;
+        return outp;
+    }
+
+    /// Look up the peers announced under `topic`.
+    PeerRecord[] lookup(ubyte[32] topic, int k = 20, Duration per = 2.seconds)
+    {
+        PeerRecord[] peers;
+        bool[string] seenPk;
+        foreach (q; iterativeQuery(topic, HS_LOOKUP, null, false, k, per))
+        {
+            if (q.value.length == 0)
+                continue;
+            auto lr = decodeLookupReply(q.value);
+            foreach (p; lr.peers)
+            {
+                immutable pk = format("%(%02x%)", p.publicKey[]);
+                if (pk !in seenPk)
+                {
+                    seenPk[pk] = true;
+                    peers ~= p;
+                }
+            }
+        }
+        return peers;
+    }
+
+    /// Announce `keyPair` under `topic`: find the closest nodes (with tokens), then
+    /// send each a signed ANNOUNCE. Returns how many nodes accepted the commit.
+    int announce(ubyte[32] topic, Keypair keyPair, Address[] relays = [], int k = 20,
+        Duration per = 2.seconds)
+    {
+        int committed;
+        foreach (q; iterativeQuery(topic, HS_LOOKUP, null, false, k, per))
+        {
+            if (q.token.length != 32)
+                continue;
+            PeerRecord peer;
+            peer.publicKey = keyPair.publicKey;
+            peer.relayAddresses = relays;
+            Announce ann;
+            ann.hasPeer = true;
+            ann.peer = peer;
+            ann.hasSignature = true;
+            ann.signature = signAnnounce(topic[], q.token, q.from.id[], peer, keyPair);
+            auto val = encodeAnnounce(ann);
+            try
+            {
+                rpc.request(Address(q.from.host, 4, q.from.port), HS_ANNOUNCE, topic[], val,
+                    q.token, false, per);
+                committed++;
+            }
+            catch (Exception)
+            {
+            }
+        }
+        return committed;
     }
 }
