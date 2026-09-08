@@ -47,6 +47,14 @@
 			]
 		},
 		{
+			"name": "dht-lookup-peer",
+			"targetType": "executable",
+			"targetName": "dht-lookup-peer",
+			"mainSourceFile": "interop/dht-lookup/app.d",
+			"sourcePaths": ["source", "interop/dht-lookup"],
+			"importPaths": ["source", "interop/dht-lookup"]
+		},
+		{
 			"name": "dht-interop-peer",
 			"targetType": "executable",
 			"targetName": "dht-interop-peer",
