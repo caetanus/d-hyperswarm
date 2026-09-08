@@ -19,5 +19,6 @@ int main(string[] args)
         "tests.uv_timer_test",
         "tests.uv_udp_test",
         "tests.udx_echo_test",
+        "tests.noise_crypto_test",
     );
 }

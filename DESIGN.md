@@ -108,7 +108,12 @@ Isolated local DHT for unit tests: bootstrap `[]`.
   - [x] **acceptance: interop vs the real JS UDX (udx-native)** — a reliable stream
         round-trips D⇄JS (interop/run-udx-interop.sh), deterministic. UDX is
         wire-compatible with the reference. **Phase 2 core complete.**
-- [ ] Phase 3: secret-stream
+- [ ] Phase 3: secret-stream (Noise_XX_Ed25519_ChaChaPoly_BLAKE2b) — wire in notes/secret-stream-port.md
+  - [x] crypto primitives: HMAC-BLAKE2b, HKDF, ChaCha20-Poly1305 IETF, Ed25519 DH —
+        byte-exact vs the JS (noise-handshake/noise-curve-ed), on libsodium
+  - [ ] Noise XX handshake (SymmetricState + the 3 messages), vectors with fixed keys
+  - [ ] secret-stream transport (uint24-LE framing + secretstream Push/Pull)
+  - [ ] acceptance: handshake + encrypted echo D⇄JS vs @hyperswarm/secret-stream
 - [ ] Phase 4: dht-rpc
 - [ ] Phase 5: hyperdht (+ holepunch)
 - [ ] Phase 6: hyperswarm

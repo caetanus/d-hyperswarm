@@ -14,7 +14,8 @@
 		"source"
 	],
 	"dependencies": {
-		"vibe-core": "~>2.0"
+		"vibe-core": "~>2.0",
+		"libsodiumd": "~>0.2"
 	},
 	"preBuildCommands": [
 		"bash $PACKAGE_DIR/vendor/build-libudx.sh"
@@ -23,7 +24,8 @@
 		"bin/libhsudx.a"
 	],
 	"libs": [
-		"m"
+		"m",
+		"sodium"
 	],
 	"configurations": [
 		{
