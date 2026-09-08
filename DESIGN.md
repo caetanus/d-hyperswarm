@@ -111,7 +111,8 @@ Isolated local DHT for unit tests: bootstrap `[]`.
 - [ ] Phase 3: secret-stream (Noise_XX_Ed25519_ChaChaPoly_BLAKE2b) — wire in notes/secret-stream-port.md
   - [x] crypto primitives: HMAC-BLAKE2b, HKDF, ChaCha20-Poly1305 IETF, Ed25519 DH —
         byte-exact vs the JS (noise-handshake/noise-curve-ed), on libsodium
-  - [ ] Noise XX handshake (SymmetricState + the 3 messages), vectors with fixed keys
+  - [x] Noise XX handshake (SymmetricState + the 3 messages) — byte-exact vs the JS
+        with fixed static+ephemeral keys; random-ephemeral run agrees on tx/rx/hash
   - [ ] secret-stream transport (uint24-LE framing + secretstream Push/Pull)
   - [ ] acceptance: handshake + encrypted echo D⇄JS vs @hyperswarm/secret-stream
 - [ ] Phase 4: dht-rpc

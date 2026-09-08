@@ -12,7 +12,7 @@ import libsodium.crypto_generichash : crypto_generichash, crypto_generichash_ini
 import libsodium.crypto_aead_chacha20poly1305 : crypto_aead_chacha20poly1305_ietf_encrypt,
     crypto_aead_chacha20poly1305_ietf_decrypt;
 import libsodium.crypto_hash_sha512 : crypto_hash_sha512;
-import libsodium.crypto_sign : crypto_sign_seed_keypair;
+import libsodium.crypto_sign : crypto_sign_seed_keypair, crypto_sign_keypair;
 import libsodium.crypto_scalarmult_ed25519 : crypto_scalarmult_ed25519_noclamp;
 
 enum size_t HASHLEN = 64; // BLAKE2b output
@@ -132,6 +132,14 @@ in (seed.length == 32)
 {
     Keypair kp;
     crypto_sign_seed_keypair(kp.publicKey.ptr, kp.secretKey.ptr, seed.ptr);
+    return kp;
+}
+
+/// A fresh random Ed25519 static keypair (for ephemeral handshake keys).
+Keypair ed25519RandomKeypair() @trusted
+{
+    Keypair kp;
+    crypto_sign_keypair(kp.publicKey.ptr, kp.secretKey.ptr);
     return kp;
 }
 
