@@ -26,5 +26,6 @@ int main(string[] args)
         "tests.dht_table_test",
         "tests.hdht_messages_test",
         "tests.connect_messages_test",
+        "tests.noise_wrap_test",
     );
 }
