@@ -21,5 +21,6 @@ int main(string[] args)
         "tests.udx_echo_test",
         "tests.noise_crypto_test",
         "tests.noise_hs_test",
+        "tests.secretstream_test",
     );
 }

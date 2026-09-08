@@ -28,6 +28,13 @@ void blake2b(ref ubyte[HASHLEN] digest, scope const(ubyte)[] data) @trusted
     crypto_generichash(digest.ptr, HASHLEN, data.ptr, data.length, null, 0);
 }
 
+/// Keyed BLAKE2b with an arbitrary output length — used for secret-stream's
+/// streamId (data = namespace, key = handshake hash) and namespace derivation.
+void keyedBlake2b(scope ubyte[] outp, scope const(ubyte)[] data, scope const(ubyte)[] key) @trusted
+{
+    crypto_generichash(outp.ptr, outp.length, data.ptr, data.length, key.ptr, key.length);
+}
+
 /// HMAC with BLAKE2b as the hash (noise-handshake/hmac.js): the message is the
 /// concatenation of `msgs`. Standard HMAC — key padded/hashed to BLOCKLEN, ipad
 /// 0x36 / opad 0x5c, two BLAKE2b passes.
