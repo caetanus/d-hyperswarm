@@ -31,6 +31,20 @@
 			"targetType": "library"
 		},
 		{
+			"name": "udx-interop-peer",
+			"targetType": "executable",
+			"targetName": "udx-interop-peer",
+			"mainSourceFile": "interop/udx-dpeer/app.d",
+			"sourcePaths": [
+				"source",
+				"interop/udx-dpeer"
+			],
+			"importPaths": [
+				"source",
+				"interop/udx-dpeer"
+			]
+		},
+		{
 			"name": "ut",
 			"targetType": "executable",
 			"targetName": "hyperswarm-test",

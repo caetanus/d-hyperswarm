@@ -1,0 +1,6 @@
+{
+  "name": "udx-interop-peer",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": { "udx-native": "^1.5.3" }
+}

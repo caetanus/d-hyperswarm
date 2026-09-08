@@ -4,3 +4,5 @@ bin/
 *.a
 dub.selections.json
 tests/vectors/node_modules/
+interop/udx-js-peer/node_modules/
+interop/udx-js-peer/package-lock.json

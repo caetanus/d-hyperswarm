@@ -104,8 +104,10 @@ Isolated local DHT for unit tests: bootstrap `[]`.
   - [x] **udx echo D↔D**: real libudx drives a reliable stream through the facade
         (D binding via the controlled hs_udx_* C-ABI surface); "hello" round-trips
         A→B→A. 21 tests, 0 failed, deterministic across runs
-  - [ ] getaddrinfo + interfaces (for udx_lookup / interface-change events)
-  - [ ] acceptance: interop vs the real JS UDX (udx-native)
+  - [ ] getaddrinfo + interfaces (for udx_lookup / interface-change events — deferred)
+  - [x] **acceptance: interop vs the real JS UDX (udx-native)** — a reliable stream
+        round-trips D⇄JS (interop/run-udx-interop.sh), deterministic. UDX is
+        wire-compatible with the reference. **Phase 2 core complete.**
 - [ ] Phase 3: secret-stream
 - [ ] Phase 4: dht-rpc
 - [ ] Phase 5: hyperdht (+ holepunch)
