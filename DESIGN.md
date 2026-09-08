@@ -145,7 +145,12 @@ Isolated local DHT for unit tests: bootstrap `[]`.
         hyperdht, so a server/relay sees our handshake from our stream socket) — rpc.d
   - [x] server side: accept a connection — IK responder + UDX stream accept (firewall)
         + connection secret-stream, proven D↔D direct (hyperswarm.dht.serve, run-serve-test.sh)
-  - [ ] make the D server discoverable via the DHT so a JS client connects to it
-        (announce router entry + relay-forward of PEER_HANDSHAKE) + wire into join(server=true)
-  - [ ] connection backoff/retry (RetryTimer), maxPeers/limit
+  - [x] D server discoverable via the DHT: a REAL hyperdht client connects to it by
+        key (announce-self → relay forwards the handshake; FROM_RELAY→FROM_SERVER
+        chain) — interop/run-server-interop.sh
+  - [x] server mode wired into join(serverMode) + **full loop D↔D** (two D hyperswarm
+        nodes on a topic discover, connect, echo) — interop/run-hyperswarm-d2d.sh
+  - [ ] connection backoff/retry (RetryTimer), maxPeers/limit (robustness)
+  - [ ] holepunch (holepuncher.js) for cross-NAT peers — the remaining crux;
+        reachable/OPEN + any-one-reachable peers work without it
   - [ ] holepunch (holepuncher.js) for non-OPEN/NAT peers (deferred; OPEN/LAN works)
