@@ -84,6 +84,7 @@ private enum : int
 
 private alias CTimerCb = extern (C) void function(uv_handle_t*) nothrow;
 private alias CCloseCb = extern (C) void function(uv_handle_t*) nothrow;
+private alias CPhaseCb = extern (C) void function(uv_handle_t*) nothrow; // prepare/check
 private alias CAllocCb = extern (C) void function(uv_handle_t*, size_t, uv_buf_t*) nothrow;
 private alias CRecvCb = extern (C) void function(uv_handle_t*, ptrdiff_t, const(uv_buf_t)*, const(sockaddr)*, uint) nothrow;
 private alias CSendCb = extern (C) void function(void*, int) nothrow;
@@ -121,6 +122,14 @@ private struct PendingClose
     CCloseCb cb;
 }
 
+/// A prepare or check handle: its callback runs each loop iteration while active
+/// (prepare before the poll/wait, check after).
+private struct PhaseHook
+{
+    CPhaseCb cb;
+    bool active;
+}
+
 /// Per-UDP-socket state. The vibe UDPConnection carries the socket; a reader
 /// fiber turns its blocking recv into libuv's alloc_cb+recv_cb callbacks.
 private final class UdpState
@@ -155,6 +164,8 @@ final class Loop
     private MonoTime epoch;
     private TimerState[void*] timers; // keyed by the handle pointer
     private UdpState[void*] udps; // keyed by the handle pointer
+    private PhaseHook[void*] prepares; // run before the poll
+    private PhaseHook[void*] checks; // run after the poll
     private PendingClose[] pendingCloses;
     private LocalManualEvent wake;
     private bool running;
@@ -235,6 +246,26 @@ final class Loop
                 c.cb(c.handle);
     }
 
+    // Run active prepare/check hooks. Collect first: a hook may start/stop hooks.
+    // Only called from run() (already non-nothrow); the `due` append may allocate.
+    private void runHooks(ref PhaseHook[void*] hooks)
+    {
+        if (hooks.length == 0)
+            return;
+        void*[] due;
+        foreach (h, ref hook; hooks)
+            if (hook.active)
+                due ~= cast(void*) h;
+        foreach (h; due)
+        {
+            auto p = h in hooks;
+            if (p is null || !p.active)
+                continue;
+            if (p.cb !is null)
+                p.cb(cast(uv_handle_t*) h);
+        }
+    }
+
     /// Drive the loop until `stop`. Runs on a vibe fiber; may block (and be
     /// interrupted) inside `wake.wait`, which is why this is not `nothrow`.
     void run()
@@ -248,21 +279,23 @@ final class Loop
             if (!running)
                 break;
 
+            runHooks(prepares); // libuv "prepare" phase — before the poll
+            if (!running)
+                break;
+
             immutable cnt = wake.emitCount;
             ulong next;
             if (nextDeadline(next))
             {
                 immutable long dms = cast(long) next - cast(long) nowMs;
-                if (dms <= 0)
-                {
-                    updateNow();
-                    continue;
-                }
-                wake.wait(dms.msecs, cnt);
+                if (dms > 0)
+                    wake.wait(dms.msecs, cnt);
             }
             else
                 wake.wait(cnt);
             updateNow();
+
+            runHooks(checks); // libuv "check" phase — after the poll
         }
     }
 
@@ -309,6 +342,31 @@ final class Loop
         poke();
     }
 
+    // ── prepare / check ops ──────────────────────────────────────────────────
+    private void registerHook(ref PhaseHook[void*] hooks, void* h) nothrow
+    {
+        hooks[h] = PhaseHook.init;
+    }
+
+    private void startHook(ref PhaseHook[void*] hooks, void* h, CPhaseCb cb) nothrow
+    {
+        auto p = h in hooks;
+        if (p is null)
+        {
+            registerHook(hooks, h);
+            p = h in hooks;
+        }
+        p.cb = cb;
+        p.active = true;
+        poke(); // force an iteration so the hook runs promptly (e.g. flush a send)
+    }
+
+    private void stopHook(ref PhaseHook[void*] hooks, void* h) nothrow
+    {
+        if (auto p = h in hooks)
+            p.active = false;
+    }
+
     // ── udp ops ──────────────────────────────────────────────────────────────
     private void registerUdp(void* h, UdpState st) nothrow
     {
@@ -330,6 +388,8 @@ final class Loop
             udps.remove(key);
         }
         timers.remove(key);
+        prepares.remove(key);
+        checks.remove(key);
         h.active = 0;
         h.closing = 1;
         if (cb !is null)
@@ -624,12 +684,63 @@ int hsuv_udp_set_membership(void* handle, const(char)* multicast_addr, const(cha
 int hsuv_udp_set_source_membership(void* handle, const(char)* multicast_addr, const(char)* interface_addr, const(char)* source_addr, int membership) nothrow { return 0; }
 
 // ── prepare / check (loop-phase hooks) ───────────────────────────────────────
-int hsuv_prepare_init(void* loop, void* prepare) nothrow { nyi("uv_prepare_init"); }
-int hsuv_prepare_start(void* prepare, void* cb) nothrow { nyi("uv_prepare_start"); }
-int hsuv_prepare_stop(void* prepare) nothrow { nyi("uv_prepare_stop"); }
-int hsuv_check_init(void* loop, void* check) nothrow { nyi("uv_check_init"); }
-int hsuv_check_start(void* check, void* cb) nothrow { nyi("uv_check_start"); }
-int hsuv_check_stop(void* check) nothrow { nyi("uv_check_stop"); }
+private int hookInit(void* loop, void* handle, int type) nothrow
+{
+    auto h = cast(uv_handle_t*) handle;
+    h.loop = cast(uv_loop_t*) loop;
+    h.type = type;
+    h.active = 0;
+    h.closing = 0;
+    auto lp = loopOf(loop);
+    lp.registerHook(type == UV_PREPARE ? lp.prepares : lp.checks, handle);
+    return 0;
+}
+
+int hsuv_prepare_init(void* loop, void* prepare) nothrow
+{
+    return hookInit(loop, prepare, UV_PREPARE);
+}
+
+int hsuv_prepare_start(void* prepare, void* cb) nothrow
+{
+    auto h = cast(uv_handle_t*) prepare;
+    h.active = 1;
+    auto lp = loopOf(cast(void*) h.loop);
+    lp.startHook(lp.prepares, prepare, cast(CPhaseCb) cb);
+    return 0;
+}
+
+int hsuv_prepare_stop(void* prepare) nothrow
+{
+    auto h = cast(uv_handle_t*) prepare;
+    h.active = 0;
+    auto lp = loopOf(cast(void*) h.loop);
+    lp.stopHook(lp.prepares, prepare);
+    return 0;
+}
+
+int hsuv_check_init(void* loop, void* check) nothrow
+{
+    return hookInit(loop, check, UV_CHECK);
+}
+
+int hsuv_check_start(void* check, void* cb) nothrow
+{
+    auto h = cast(uv_handle_t*) check;
+    h.active = 1;
+    auto lp = loopOf(cast(void*) h.loop);
+    lp.startHook(lp.checks, check, cast(CPhaseCb) cb);
+    return 0;
+}
+
+int hsuv_check_stop(void* check) nothrow
+{
+    auto h = cast(uv_handle_t*) check;
+    h.active = 0;
+    auto lp = loopOf(cast(void*) h.loop);
+    lp.stopHook(lp.checks, check);
+    return 0;
+}
 
 // ── DNS ──────────────────────────────────────────────────────────────────────
 int hsuv_getaddrinfo(void* loop, void* req, void* cb, const(char)* node, const(char)* service, const(void)* hints) nothrow { nyi("uv_getaddrinfo"); }
@@ -640,4 +751,9 @@ int hsuv_interface_addresses(void* addresses, int* count) nothrow { nyi("uv_inte
 void hsuv_free_interface_addresses(void* addresses, int count) nothrow { nyi("uv_free_interface_addresses"); }
 
 // ── misc ─────────────────────────────────────────────────────────────────────
-const(char)* hsuv_strerror(int err) nothrow { nyi("uv_strerror"); }
+const(char)* hsuv_strerror(int err) nothrow
+{
+    // libudx only uses this for debug logging (compiled out) and assert messages;
+    // a stable static string is enough. The literal is null-terminated.
+    return "hsuv: udx error".ptr;
+}

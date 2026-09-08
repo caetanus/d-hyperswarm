@@ -100,9 +100,12 @@ Isolated local DHT for unit tests: bootstrap `[]`.
         cbs)/getsockname/send (fiber)/try_send (raw non-blocking sendmsg)/set_ttl
         (setsockopt via fd — holepunch needs it)/buffer-sizes/fileno; multicast stubbed.
         Test: a datagram sent through the facade is received on the vibe loop
-  - [ ] prepare/check + close
-  - [ ] getaddrinfo + interfaces + strerror
-  - [ ] udx echo D↔D, then acceptance D↔JS
+  - [x] prepare/check (loop-phase hooks: prepare before poll, check after) + strerror
+  - [x] **udx echo D↔D**: real libudx drives a reliable stream through the facade
+        (D binding via the controlled hs_udx_* C-ABI surface); "hello" round-trips
+        A→B→A. 21 tests, 0 failed, deterministic across runs
+  - [ ] getaddrinfo + interfaces (for udx_lookup / interface-change events)
+  - [ ] acceptance: interop vs the real JS UDX (udx-native)
 - [ ] Phase 3: secret-stream
 - [ ] Phase 4: dht-rpc
 - [ ] Phase 5: hyperdht (+ holepunch)

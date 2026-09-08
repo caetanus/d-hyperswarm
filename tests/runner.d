@@ -18,5 +18,6 @@ int main(string[] args)
         "tests.udx_link_test",
         "tests.uv_timer_test",
         "tests.uv_udp_test",
+        "tests.udx_echo_test",
     );
 }

@@ -63,3 +63,54 @@ namespace udx {
 #include "udx.c"
 
 } // namespace udx
+
+// ── controlled C-ABI surface for the D binding ───────────────────────────────
+// Thin forwarders to the udx:: API. This is the ONLY set of global C symbols the
+// amalgamation exposes for udx (everything else stays under udx::); D calls these
+// via extern(C) with opaque void* pointers, so it never touches C++ mangling.
+// Sizes let D allocate the opaque structs without mirroring their layout.
+extern "C" {
+
+size_t hs_udx_sizeof_udx (void) { return sizeof(udx::udx_t); }
+size_t hs_udx_sizeof_socket (void) { return sizeof(udx::udx_socket_t); }
+size_t hs_udx_sizeof_stream (void) { return sizeof(udx::udx_stream_t); }
+
+int hs_udx_init (uv_loop_t *loop, void *udx, void *on_idle) {
+  return udx::udx_init(loop, (udx::udx_t *) udx, (udx::udx_idle_cb) on_idle);
+}
+
+int hs_udx_socket_init (void *u, void *s, void *close_cb) {
+  return udx::udx_socket_init((udx::udx_t *) u, (udx::udx_socket_t *) s, (udx::udx_socket_close_cb) close_cb);
+}
+int hs_udx_socket_bind (void *s, const struct sockaddr *addr, unsigned int flags) {
+  return udx::udx_socket_bind((udx::udx_socket_t *) s, addr, flags);
+}
+int hs_udx_socket_getsockname (void *s, struct sockaddr *name, int *name_len) {
+  return udx::udx_socket_getsockname((udx::udx_socket_t *) s, name, name_len);
+}
+int hs_udx_socket_close (void *s) {
+  return udx::udx_socket_close((udx::udx_socket_t *) s);
+}
+
+int hs_udx_stream_init (void *u, void *stream, uint32_t local_id, void *close_cb, void *finalize_cb) {
+  return udx::udx_stream_init((udx::udx_t *) u, (udx::udx_stream_t *) stream, local_id,
+                             (udx::udx_stream_close_cb) close_cb, (udx::udx_stream_finalize_cb) finalize_cb);
+}
+int hs_udx_stream_connect (void *stream, void *socket, uint32_t remote_id, const struct sockaddr *remote_addr) {
+  return udx::udx_stream_connect((udx::udx_stream_t *) stream, (udx::udx_socket_t *) socket, remote_id, remote_addr);
+}
+int hs_udx_stream_read_start (void *stream, void *cb) {
+  return udx::udx_stream_read_start((udx::udx_stream_t *) stream, (udx::udx_stream_read_cb) cb);
+}
+int hs_udx_stream_write_sizeof (int nwbufs) {
+  return udx::udx_stream_write_sizeof(nwbufs);
+}
+int hs_udx_stream_write (void *req, void *stream, const uv_buf_t bufs[], unsigned int bufs_len, void *ack_cb) {
+  return udx::udx_stream_write((udx::udx_stream_write_t *) req, (udx::udx_stream_t *) stream, bufs, bufs_len,
+                              (udx::udx_stream_ack_cb) ack_cb);
+}
+int hs_udx_stream_destroy (void *stream) {
+  return udx::udx_stream_destroy((udx::udx_stream_t *) stream);
+}
+
+} // extern "C"
