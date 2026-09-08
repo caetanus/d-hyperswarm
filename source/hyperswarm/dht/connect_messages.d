@@ -303,3 +303,123 @@ NoisePayload decodeNoisePayload(ubyte[] buf)
     }
     return m;
 }
+
+// ── holepunch envelope + payload (lib/messages.js, over PEER_HOLEPUNCH) ───────
+
+/// The PEER_HOLEPUNCH message envelope: routed like the handshake, it carries the
+/// holepunchSecret-encrypted `payload` between the two peers during a punch.
+struct Holepunch
+{
+    uint mode;
+    uint id;
+    ubyte[] payload;
+    bool hasPeerAddress;
+    Address peerAddress;
+}
+
+ubyte[] encodeHolepunch(Holepunch m)
+{
+    State s;
+    s.end += 2; // flags + mode
+    Uint.preencode(s, m.id);
+    Buffer.preencode(s, m.payload);
+    if (m.hasPeerAddress)
+        s.end += 6;
+
+    s.buffer = new ubyte[](s.end);
+    Uint.encode(s, m.hasPeerAddress ? 1 : 0);
+    Uint.encode(s, m.mode);
+    Uint.encode(s, m.id);
+    Buffer.encode(s, m.payload);
+    if (m.hasPeerAddress)
+        Ipv4Address.encode(s, m.peerAddress);
+    return s.buffer;
+}
+
+Holepunch decodeHolepunch(ubyte[] buf)
+{
+    auto s = State(0, buf.length, buf);
+    immutable flags = Uint.decode(s);
+    Holepunch m;
+    m.mode = cast(uint) Uint.decode(s);
+    m.id = cast(uint) Uint.decode(s);
+    m.payload = Buffer.decode(s);
+    if (flags & 1)
+    {
+        m.hasPeerAddress = true;
+        m.peerAddress = Ipv4Address.decode(s);
+    }
+    return m;
+}
+
+/// The holepunch payload (encrypted inside `Holepunch.payload`): the NAT/punch
+/// state the two sides exchange each round (firewall, addresses, tokens, …).
+struct HolepunchPayload
+{
+    uint error;
+    uint firewall;
+    uint round;
+    bool connected;
+    bool punching;
+    Address[] addresses;
+    bool hasRemoteAddress;
+    Address remoteAddress;
+    ubyte[] token; // 32 bytes, or null
+    ubyte[] remoteToken; // 32 bytes, or null
+}
+
+ubyte[] encodeHolepunchPayload(HolepunchPayload m)
+{
+    State s;
+    s.end += 4; // flags + error + firewall + round
+    if (m.addresses.length)
+        Ipv4Array.preencode(s, m.addresses);
+    if (m.hasRemoteAddress)
+        s.end += 6;
+    if (m.token.length)
+        s.end += 32;
+    if (m.remoteToken.length)
+        s.end += 32;
+
+    s.buffer = new ubyte[](s.end);
+    immutable ubyte flags = cast(ubyte)(
+        (m.connected ? 1 : 0) | (m.punching ? 2 : 0) | (m.addresses.length ? 4 : 0)
+        | (m.hasRemoteAddress ? 8 : 0) | (m.token.length ? 16 : 0) | (m.remoteToken.length ? 32 : 0));
+    Uint.encode(s, flags);
+    Uint.encode(s, m.error);
+    Uint.encode(s, m.firewall);
+    Uint.encode(s, m.round);
+    if (m.addresses.length)
+        Ipv4Array.encode(s, m.addresses);
+    if (m.hasRemoteAddress)
+        Ipv4Address.encode(s, m.remoteAddress);
+    if (m.token.length)
+        Fixed32.encode(s, m.token);
+    if (m.remoteToken.length)
+        Fixed32.encode(s, m.remoteToken);
+    return s.buffer;
+}
+
+HolepunchPayload decodeHolepunchPayload(ubyte[] buf)
+{
+    auto s = State(0, buf.length, buf);
+    immutable flags = Uint.decode(s);
+    HolepunchPayload m;
+    m.error = cast(uint) Uint.decode(s);
+    m.firewall = cast(uint) Uint.decode(s);
+    m.round = cast(uint) Uint.decode(s);
+    m.connected = (flags & 1) != 0;
+    m.punching = (flags & 2) != 0;
+    if (flags & 4)
+        m.addresses = Ipv4Array.decode(s);
+    if (flags & 8)
+    {
+        m.hasRemoteAddress = true;
+        m.remoteAddress = Ipv4Address.decode(s);
+    }
+    if (flags & 16)
+        m.token = Fixed32.decode(s);
+    if (flags & 32)
+        m.remoteToken = Fixed32.decode(s);
+    return m;
+}
