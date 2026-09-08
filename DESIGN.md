@@ -135,4 +135,10 @@ Isolated local DHT for unit tests: bootstrap `[]`.
   - [ ] HOLEPUNCH (holepuncher.js) for non-OPEN/NAT peers — deferred (OPEN/LAN works)
   - [ ] D server side (accept incoming connects) so two D peers connect
 - [ ] Phase 6: hyperswarm — join(topic)/on(connection), dedup + backoff
-- [ ] Phase 6: hyperswarm
+  - [x] client layer: Hyperswarm (keyPair + Dht + udx socket), join(topic) discovery
+        loop (lookup → connect by pubkey), Connection (UDX stream + secret-stream),
+        de-dup by remote pubkey — hyperswarm.swarm / hyperswarm.connection
+  - [x] topic discovery wire-compat vs a real hyperswarm (interop/run-hyperswarm-interop.sh)
+  - [ ] complete the encrypted connection through a relay — needs the dht-rpc/udx
+        socket unification (run rpc over the facade udx socket, one socket like hyperdht)
+  - [ ] connection backoff/retry (RetryTimer), maxPeers/limit, server mode (accept)
