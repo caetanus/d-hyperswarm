@@ -14,3 +14,5 @@ interop/hyperdht-js-peer/node_modules/
 interop/hyperdht-js-peer/package-lock.json
 interop/hyperswarm-js-peer/node_modules/
 interop/hyperswarm-js-peer/package-lock.json
+interop/dht-server-js/node_modules/
+interop/dht-server-js/package-lock.json

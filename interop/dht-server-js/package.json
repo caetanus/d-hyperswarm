@@ -1,0 +1,1 @@
+{ "name": "dht-server-js", "private": true, "dependencies": { "hyperdht": "^6.21.0" } }

@@ -14,15 +14,19 @@ import hyperswarm.dht.noise_wrap : NoiseWrap, HandshakeResult;
 import hyperswarm.dht.connect_messages : Handshake, NoisePayload, UdxInfo, FW_OPEN,
     encodeHandshake, decodeHandshake;
 import hyperswarm.dht.messages : HS_PEER_HANDSHAKE;
-import hyperswarm.dht.wire : RequestPacket, encodeReply;
+import hyperswarm.dht.wire : RequestPacket, encodeReply, encodeRequest;
 import hyperswarm.connection : Connection, hsConnRead, hsConnClose, hsConnFinalize;
 import hyperswarm.udx.udx;
 import hyperswarm.noise.stream : SecretStream;
-import hyperswarm.noise.crypto : Keypair;
+import hyperswarm.noise.crypto : Keypair, keyedBlake2b;
 import hyperswarm.cenc : Address;
 import std.random : uniform;
 
-private enum uint REPLY = 4; // handshake relay mode (lib/router.js)
+// handshake relay modes (lib/router.js)
+private enum uint FROM_CLIENT = 0;
+private enum uint FROM_SERVER = 1;
+private enum uint FROM_RELAY = 2;
+private enum uint REPLY = 4;
 
 // Per-incoming-stream accept state, keyed by the udx stream pointer, so the C
 // firewall callback can bind the stream to the client it belongs to. Cooperative
@@ -62,6 +66,16 @@ final class Server
         this.keyPair = keyPair;
         this.ourUdxAddr = Address("127.0.0.1", 4, dht.rpc.localPort);
         dht.rpc.onRequest = &onRequest;
+    }
+
+    /// Announce ourselves under BLAKE2b(publicKey) (an announce-self / "listen"),
+    /// so the nodes we announce to set a router entry pointing back at our socket
+    /// and forward PEER_HANDSHAKE to us — i.e. a client can find + reach us by key.
+    int listen()
+    {
+        ubyte[32] target;
+        keyedBlake2b(target[], keyPair.publicKey[], []);
+        return dht.announce(target, keyPair, [ourUdxAddr]);
     }
 
     private void onRequest(RequestPacket req, Address from) nothrow
@@ -111,10 +125,26 @@ final class Server
         };
         g_incoming[stream.ptr] = Incoming(clientPayload.udx.id, conn);
 
-        // Reply with msg2 through the same socket the request arrived on.
-        Handshake reply;
-        reply.mode = REPLY;
-        reply.noise = msg2;
-        dht.rpc.send(from, encodeReply(req.tid, from, null, null, null, 0, encodeHandshake(reply)));
+        // Send msg2 back the way the request came. A direct FROM_CLIENT connect gets
+        // a plain REPLY. A relayed FROM_RELAY connect is relayed onward as a
+        // FROM_SERVER request back to the relay (carrying the client's tid and its
+        // address), which the relay turns into the client's reply (lib/router.js).
+        if (env.mode == FROM_RELAY)
+        {
+            Handshake back;
+            back.mode = FROM_SERVER;
+            back.noise = msg2;
+            back.hasPeerAddress = env.hasPeerAddress;
+            back.peerAddress = env.peerAddress;
+            dht.rpc.send(from, encodeRequest(req.tid, from, HS_PEER_HANDSHAKE, req.target,
+                encodeHandshake(back), null, null, false));
+        }
+        else
+        {
+            Handshake reply;
+            reply.mode = REPLY;
+            reply.noise = msg2;
+            dht.rpc.send(from, encodeReply(req.tid, from, null, null, null, 0, encodeHandshake(reply)));
+        }
     }
 }
