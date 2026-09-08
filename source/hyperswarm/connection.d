@@ -42,6 +42,8 @@ final class Connection
     bool opened;
     /// Delegate invoked with each decrypted application message.
     void delegate(ubyte[]) nothrow onData;
+    /// Delegate invoked once, when the secret-stream finishes opening.
+    void delegate() nothrow onOpen;
 
     this(void* udx, void* stream, SecretStream ss, ubyte[32] remotePublicKey) nothrow
     {
@@ -99,8 +101,11 @@ final class Connection
             auto r = ss.feed(raw);
             if (r.toSend.length)
                 writeRaw(r.toSend);
+            immutable wasOpen = opened;
             if (ss.opened)
                 opened = true;
+            if (opened && !wasOpen && onOpen !is null)
+                onOpen();
             if (onData !is null)
                 foreach (m; r.messages)
                     onData(m);

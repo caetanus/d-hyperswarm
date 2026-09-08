@@ -89,3 +89,38 @@ ConnectHandshake connectHandshake(Dht dht, ubyte[32] publicKey, Keypair keyPair,
     Address serverAddress = rhs.hasPeerAddress ? rhs.peerAddress : Address(relay.host, 4, relay.port);
     return ConnectHandshake(result, serverAddress, serverPayload, ourUdxId);
 }
+
+/// Connect directly to a server at a known address (skip FIND_PEER): send the
+/// PEER_HANDSHAKE straight to `serverAddr`. Used for a direct connect on a LAN /
+/// localhost where the peer's address is already known (no DHT discovery/relay).
+ConnectHandshake connectHandshakeTo(Dht dht, ubyte[32] publicKey, Keypair keyPair,
+    Address serverAddr, Address ourAddress, uint ourUdxId, Duration per = 3.seconds)
+{
+    ubyte[32] target;
+    keyedBlake2b(target[], publicKey[], []); // target = BLAKE2b(publicKey)
+
+    auto wrap = new NoiseWrap(keyPair, publicKey[]);
+    NoisePayload p;
+    p.firewall = FW_OPEN;
+    p.addresses4 = [ourAddress];
+    p.hasUdx = true;
+    p.udx = UdxInfo(1, false, ourUdxId, 0);
+    p.hasSecretStream = true;
+    auto msg1 = wrap.send(p);
+
+    Handshake env;
+    env.mode = FROM_CLIENT;
+    env.noise = msg1;
+    auto reply = dht.rpc.request(serverAddr, HS_PEER_HANDSHAKE, target[],
+        encodeHandshake(env), null, false, per);
+
+    if (reply.value.length == 0)
+        throw new Exception("connect: empty handshake reply");
+    auto rhs = decodeHandshake(reply.value);
+    if (rhs.mode != REPLY || rhs.noise.length == 0)
+        throw new Exception("connect: bad handshake reply");
+
+    auto serverPayload = wrap.recv(rhs.noise);
+    auto result = wrap.finish();
+    return ConnectHandshake(result, serverAddr, serverPayload, ourUdxId);
+}

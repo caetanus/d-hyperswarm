@@ -63,6 +63,14 @@
 			"importPaths": ["source", "interop/hyperswarm-dpeer"]
 		},
 		{
+			"name": "dht-serve-peer",
+			"targetType": "executable",
+			"targetName": "dht-serve-peer",
+			"mainSourceFile": "interop/dht-serve/app.d",
+			"sourcePaths": ["source", "interop/dht-serve"],
+			"importPaths": ["source", "interop/dht-serve"]
+		},
+		{
 			"name": "dht-announce-peer",
 			"targetType": "executable",
 			"targetName": "dht-announce-peer",

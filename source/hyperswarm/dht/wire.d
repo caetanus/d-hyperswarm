@@ -78,6 +78,47 @@ ubyte[] encodeRequest(ushort tid, Address to, uint command,
     return s.buffer;
 }
 
+/// Encode a reply datagram (the responder side). `to` is the requester's address
+/// as we observed it (NAT detection); `id`/`token`/`closerNodes`/`value` are
+/// optional; a non-zero `error` is included.
+ubyte[] encodeReply(ushort tid, Address to, scope const(ubyte)[] id = null,
+    scope const(ubyte)[] token = null, Address[] closerNodes = null,
+    uint error = 0, scope const(ubyte)[] value = null)
+{
+    State s;
+    s.end = 1 + 1 + 6 + 2; // type + flags + ipv4 to + uint16 tid
+    if (id.length)
+        s.end += 32;
+    if (token.length)
+        s.end += 32;
+    if (closerNodes.length)
+        Ipv4Array.preencode(s, closerNodes);
+    if (error)
+        Uint.preencode(s, error);
+    if (value.length)
+        Buffer.preencode(s, value);
+
+    s.buffer = new ubyte[](s.end);
+    s.buffer[s.start++] = RESPONSE_ID;
+    s.buffer[s.start++] = cast(ubyte)(
+        (id.length ? 1 : 0) | (token.length ? 2 : 0) | (closerNodes.length ? 4 : 0)
+        | (error ? 8 : 0) | (value.length ? 16 : 0));
+
+    Uint16.encode(s, tid);
+    Ipv4Address.encode(s, to);
+    if (id.length)
+        Fixed32.encode(s, id);
+    if (token.length)
+        Fixed32.encode(s, token);
+    if (closerNodes.length)
+        Ipv4Array.encode(s, closerNodes);
+    if (error)
+        Uint.encode(s, error);
+    if (value.length)
+        Buffer.encode(s, value);
+    return s.buffer;
+}
+
 /// A decoded reply datagram.
 struct Reply
 {

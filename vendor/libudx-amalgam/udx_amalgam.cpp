@@ -107,6 +107,9 @@ int hs_udx_stream_init (void *u, void *stream, uint32_t local_id, void *close_cb
 int hs_udx_stream_connect (void *stream, void *socket, uint32_t remote_id, const struct sockaddr *remote_addr) {
   return udx::udx_stream_connect((udx::udx_stream_t *) stream, (udx::udx_socket_t *) socket, remote_id, remote_addr);
 }
+int hs_udx_stream_firewall (void *stream, void *firewall_cb) {
+  return udx::udx_stream_firewall((udx::udx_stream_t *) stream, (udx::udx_stream_firewall_cb) firewall_cb);
+}
 int hs_udx_stream_read_start (void *stream, void *cb) {
   return udx::udx_stream_read_start((udx::udx_stream_t *) stream, (udx::udx_stream_read_cb) cb);
 }

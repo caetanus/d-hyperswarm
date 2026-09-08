@@ -23,6 +23,7 @@ import core.time : Duration, seconds;
 import core.sys.posix.sys.socket : sockaddr, sockaddr_storage, AF_INET;
 import core.sys.posix.netinet.in_ : sockaddr_in;
 import core.sys.posix.arpa.inet : htons, ntohs;
+import std.format : format;
 
 // Route the udx socket's non-stream datagrams (dht-rpc replies) to the owning Rpc.
 // Cooperative single-threaded (the facade loop + callbacks run on one vibe thread),
@@ -34,7 +35,21 @@ extern (C) void hsRpcRecv(void* socket, ptrdiff_t len, const(uv_buf_t)* buf, con
     if (len <= 0)
         return;
     if (auto r = socket in g_rpcBySock)
-        r.onDatagram(cast(ubyte[]) buf.base[0 .. len]);
+        r.onDatagram(cast(ubyte[]) buf.base[0 .. len], from);
+}
+
+private Address addrFromSockaddr(const(void)* sa) nothrow
+{
+    auto sin = cast(const(sockaddr_in)*) sa;
+    immutable a = sin.sin_addr.s_addr; // network byte order
+    auto b = *cast(const(ubyte[4])*)&a;
+    string host;
+    try
+        host = format("%d.%d.%d.%d", b[0], b[1], b[2], b[3]);
+    catch (Exception)
+    {
+    }
+    return Address(host, 4, ntohs(sin.sin_port));
 }
 
 extern (C) void hsRpcSockClose(void* s) nothrow {}
@@ -56,6 +71,10 @@ final class Rpc
     }
 
     private Pending[ushort] pending;
+
+    /// Set to act as a dht-rpc server: invoked for each incoming REQUEST datagram
+    /// with the decoded request and the sender's address. Reply with `send`.
+    void delegate(RequestPacket req, Address from) nothrow onRequest;
 
     // udx may reference a send buffer until the datagram is flushed; keep the last
     // N (req block + payload) alive in a ring. dht-rpc is low volume, so by the time
@@ -165,15 +184,35 @@ final class Rpc
         hs_udx_socket_send(sreq.ptr, sock.ptr, &b, 1, cast(const(void)*) na.sockAddr, null);
     }
 
-    // Called from the udx socket recv callback with one datagram.
-    package void onDatagram(ubyte[] got) nothrow
+    /// Send a raw datagram to `to` (used to reply to a request).
+    void send(Address to, ubyte[] datagram)
     {
-        if (!running || got.length < 2 || got[0] != RESPONSE_ID)
+        sendDatagram(datagram, to);
+    }
+
+    // Called from the udx socket recv callback with one datagram.
+    package void onDatagram(ubyte[] got, const(void)* from) nothrow
+    {
+        if (!running || got.length < 2)
+            return;
+        // dup: decoded fields slice into the packet, and the recv buffer is reused —
+        // the decoded message must own its bytes past this callback.
+        if (got[0] == REQUEST_ID)
+        {
+            if (onRequest is null)
+                return;
+            RequestPacket req;
+            try
+                req = decodeRequest(got.dup);
+            catch (Exception)
+                return;
+            onRequest(req, addrFromSockaddr(from));
+            return;
+        }
+        if (got[0] != RESPONSE_ID)
             return;
         Reply r;
         try
-            // dup: decoded fields slice into the packet, and the recv buffer is
-            // reused — the reply must own its bytes past this callback.
             r = decodeReply(got.dup);
         catch (Exception)
             return;
