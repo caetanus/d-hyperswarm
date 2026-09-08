@@ -1,0 +1,8 @@
+{
+  "name": "hyperswarm-js-peer",
+  "private": true,
+  "dependencies": {
+    "hyperswarm": "^4.17.0",
+    "hyperdht": "^6.21.0"
+  }
+}
