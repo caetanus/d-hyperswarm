@@ -66,12 +66,61 @@ final class Connection
     private ubyte[][][void*] pending;
     bool opened;
     bool closed;
-    /// Delegate invoked with each decrypted application message.
-    void delegate(ubyte[]) nothrow onData;
-    /// Delegate invoked once, when the secret-stream finishes opening.
-    void delegate() nothrow onOpen;
+    // Handlers registered late must not miss what already happened: the connect
+    // path opens the secret-stream (and may receive the peer's first app bytes)
+    // before the caller gets the Connection to set onData/onOpen on. So these are
+    // properties — decrypted messages that arrive before onData is set are held
+    // in earlyMessages and flushed the instant it is, and onOpen fires on the
+    // open edge or the moment a handler is set after it, whichever is later, once.
+    private void delegate(ubyte[]) nothrow onData_;
+    private void delegate() nothrow onOpen_;
+    private ubyte[][] earlyMessages;
+    private bool openFired;
     /// Delegate invoked when the underlying UDX stream closes.
     void delegate() nothrow onClose;
+
+    /// Decrypted application messages. Setting a handler drains anything that
+    /// arrived before it was set, so a peer that writes first is never lost.
+    void onData(void delegate(ubyte[]) nothrow cb) nothrow
+    {
+        onData_ = cb;
+        if (cb is null || earlyMessages.length == 0)
+            return;
+        auto held = earlyMessages;
+        earlyMessages = null;
+        try
+            foreach (m; held)
+                cb(m);
+        catch (Exception)
+        {
+        }
+    }
+
+    void delegate(ubyte[]) nothrow onData() nothrow
+    {
+        return onData_;
+    }
+
+    /// Fired once when the secret-stream finishes opening. Setting a handler after
+    /// the connection is already open fires it immediately (the edge is not lost).
+    void onOpen(void delegate() nothrow cb) nothrow
+    {
+        onOpen_ = cb;
+        if (cb !is null && opened && !openFired)
+        {
+            openFired = true;
+            try
+                cb();
+            catch (Exception)
+            {
+            }
+        }
+    }
+
+    void delegate() nothrow onOpen() nothrow
+    {
+        return onOpen_;
+    }
 
     this(void* udx, void* stream, SecretStream ss, ubyte[32] remotePublicKey) nothrow
     {
@@ -149,17 +198,94 @@ final class Connection
             auto r = ss.feed(raw);
             if (r.toSend.length)
                 writeRaw(r.toSend);
-            immutable wasOpen = opened;
             if (ss.opened)
                 opened = true;
-            if (opened && !wasOpen && onOpen !is null)
-                onOpen();
-            if (onData !is null)
+            if (opened && !openFired && onOpen_ !is null)
+            {
+                openFired = true;
+                onOpen_();
+            }
+            // Deliver decrypted messages, or hold them until onData is set — a peer
+            // that writes before we have a handler must not lose those bytes.
+            if (onData_ !is null)
                 foreach (m; r.messages)
-                    onData(m);
+                    onData_(m);
+            else
+                foreach (m; r.messages)
+                    earlyMessages ~= m.dup;
         }
         catch (Exception)
         {
         }
     }
+}
+
+// The connect path opens the secret-stream (and can receive the peer's first app
+// bytes) before the caller sets onData — so a peer that writes first must still be
+// delivered once a handler registers, and onOpen must not be lost either. Drives
+// the real onReadRaw with post-open data frames (no toSend, so the udx stream is
+// never touched) after opening both secret-streams in memory.
+@("connection buffers app data that arrives before onData is set")
+unittest
+{
+    import hyperswarm.noise.stream : SecretStream;
+    import hyperswarm.noise.crypto : ed25519Keypair, Keypair;
+
+    static Keypair kp(ubyte v)
+    {
+        ubyte[32] s = v;
+        return ed25519Keypair(s[]);
+    }
+
+    // Open both ends fully (the handshake dance), OUTSIDE any Connection.
+    auto a = new SecretStream(true, kp(1)); // the remote peer that writes first
+    auto b = new SecretStream(false, kp(2)); // the ss the Connection wraps
+    b.start();
+    auto forB = a.start();
+    ubyte[] forA;
+    foreach (_; 0 .. 24)
+    {
+        if (forB.length)
+        {
+            auto r = b.feed(forB);
+            forB = null;
+            forA ~= r.toSend;
+        }
+        if (forA.length)
+        {
+            auto r = a.feed(forA);
+            forA = null;
+            forB ~= r.toSend;
+        }
+        if (a.opened && b.opened)
+            break;
+    }
+    assert(a.opened && b.opened);
+
+    auto dummyStream = cast(void*) 0xC0FFEE; // unique key; never dereferenced post-open
+    ubyte[32] pk;
+    auto conn = new Connection(null, dummyStream, b, pk);
+    scope (exit)
+        g_conns.remove(dummyStream); // don't destroy(): that would touch the udx stream
+
+    // The peer writes before we register onData — the frame must be held, not lost.
+    conn.onReadRaw(a.write(cast(const(ubyte)[]) "MANIFEST"));
+    assert(conn.opened);
+
+    ubyte[][] got;
+    conn.onData = (ubyte[] m) nothrow { got ~= m; }; // setting it drains the buffer
+    assert(got.length == 1);
+    assert(cast(string) got[0] == "MANIFEST");
+
+    // Once a handler is set, later frames deliver straight through.
+    conn.onReadRaw(a.write(cast(const(ubyte)[]) "WANT"));
+    assert(got.length == 2);
+    assert(cast(string) got[1] == "WANT");
+
+    // onOpen registered after the open edge still fires, exactly once.
+    int opens;
+    conn.onOpen = () nothrow { opens++; };
+    assert(opens == 1);
+    conn.onReadRaw(a.write(cast(const(ubyte)[]) "MORE"));
+    assert(opens == 1); // not re-fired
 }
