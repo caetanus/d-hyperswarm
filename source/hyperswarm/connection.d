@@ -10,6 +10,10 @@
 /// distinct heap pointers, so independent instances don't collide.
 module hyperswarm.connection;
 
+import core.time : Duration, MonoTime, msecs, seconds;
+
+import vibe.core.core : sleep;
+
 import hyperswarm.udx.udx;
 import hyperswarm.udx.facade : uv_buf_t;
 import hyperswarm.noise.stream : SecretStream;
@@ -131,8 +135,42 @@ final class Connection
         g_conns[stream] = this;
     }
 
+    /// Writes handed to udx but not yet acknowledged by the far end. Reaches zero
+    /// once everything written has actually been delivered.
+    size_t pendingWrites() const nothrow @safe
+    {
+        return pending.length;
+    }
+
+    /// Block until every write so far is acked (all data delivered) or `timeout`
+    /// elapses; returns true if fully drained. Call this before destroy() — the
+    /// destroy is a HARD close that drops udx's unflushed send queue, so a large
+    /// transfer followed by an immediate close loses whatever is still in flight.
+    bool flush(Duration timeout = 30.seconds)
+    {
+        immutable deadline = MonoTime.currTime + timeout;
+        while (!closed && pending.length > 0 && MonoTime.currTime < deadline)
+            sleep(5.msecs);
+        return pending.length == 0;
+    }
+
+    /// Flush, then tear down — the safe way to close after sending: waits for the
+    /// far end to ack everything (up to `timeout`) before the hard destroy, so a
+    /// final burst (a big file's tail, a COMPLETE frame) isn't dropped.
+    void closeGracefully(Duration timeout = 30.seconds) nothrow
+    {
+        try
+            flush(timeout);
+        catch (Exception)
+        {
+        }
+        destroy();
+    }
+
     /// Tear the connection down (destroys the UDX stream; the close callback then
-    /// clears the registries and fires onClose).
+    /// clears the registries and fires onClose). HARD close: any writes udx has
+    /// queued but not yet flushed are dropped — call flush()/closeGracefully()
+    /// first if the peer still needs what you just wrote.
     void destroy() nothrow
     {
         if (closed)
@@ -157,7 +195,17 @@ final class Connection
             pending[req.ptr] = [req, d];
             g_writeOwner[req.ptr] = this;
             auto b = uv_buf_t(cast(char*) d.ptr, d.length);
-            hs_udx_stream_write(req.ptr, stream, &b, 1, &hsConnAck);
+            // udx queues the write and acks it later (return 0 = over the high
+            // watermark but still queued, 1 = ok); a NEGATIVE return means it did
+            // not queue (stream ending/not connected), so no ack will ever fire —
+            // drop the pending entry we just made, or it strands drained()/flush()
+            // forever. The data is lost in that case (the stream is going away).
+            immutable rc = hs_udx_stream_write(req.ptr, stream, &b, 1, &hsConnAck);
+            if (rc < 0)
+            {
+                pending.remove(req.ptr);
+                g_writeOwner.remove(req.ptr);
+            }
         }
         catch (Exception)
         {
