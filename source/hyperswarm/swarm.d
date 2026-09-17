@@ -18,7 +18,7 @@ import hyperswarm.noise.stream : SecretStream;
 import hyperswarm.noise.crypto : Keypair, ed25519Keypair, ed25519RandomKeypair;
 import hyperswarm.cenc : Address;
 import vibe.core.core : runTask, sleep;
-import core.time : msecs;
+import core.time : msecs, seconds, Duration;
 import core.sys.posix.sys.socket : sockaddr, AF_INET;
 import core.sys.posix.netinet.in_ : sockaddr_in;
 import core.sys.posix.arpa.inet : htons, inet_addr;
@@ -45,6 +45,14 @@ final class Hyperswarm
     /// Cap on concurrent connections (client + server). Further peers are ignored
     /// until a slot frees; a rejoined discovery re-offers them.
     size_t maxPeers = 64;
+    /// How often a server re-announces its topic and itself. A single announce at
+    /// join can land while our routing table is still cold — stored at the nodes
+    /// we happened to know, not the ones actually closest to the topic — so a
+    /// converged client never finds it; and DHT records expire. Re-announcing
+    /// re-runs the query (warming the table toward the topic) and refreshes the
+    /// record, so a cold first announce self-corrects and a long-lived server
+    /// stays findable. Well under any record TTL; lower it for snappier interop.
+    Duration announceInterval = 30.seconds;
     private Server server;
 
     // The address we advertise for connections: what the DHT reports back to us
@@ -110,18 +118,10 @@ final class Hyperswarm
         if (serverMode)
         {
             auto t = topic;
-            // announce the topic (so a lookup finds us) + announce-self (so the
-            // connect handshake can be routed to us), then keep serving.
-            runTask(() nothrow {
-                try
-                {
-                    server.listen(); // announce-self under BLAKE2b(publicKey)
-                    dht.announce(t, keyPair, [ourUdxAddr]); // topic record
-                }
-                catch (Exception)
-                {
-                }
-            });
+            // Announce the topic (so a lookup finds us) + announce-self (so the
+            // connect handshake can be routed to us), and keep re-announcing so a
+            // cold-table first announce self-corrects and the record stays fresh.
+            runTask(() nothrow { announceLoop(t); });
         }
         if (client && (hex in topics) is null)
         {
@@ -149,6 +149,33 @@ final class Hyperswarm
             dht.close();
         catch (Exception)
         {
+        }
+    }
+
+    // Server mode: (re-)announce the topic and ourselves on an interval. The
+    // first announce can land on a cold routing table (the wrong nodes); each
+    // re-announce re-runs the query, warming toward the topic and re-storing on
+    // the nodes actually closest to it, and refreshes the record before it
+    // expires. Runs until the swarm is closed.
+    private void announceLoop(ubyte[32] topic) nothrow
+    {
+        immutable ticks = cast(int)(announceInterval.total!"msecs" / 100);
+        while (!destroyed)
+        {
+            try
+            {
+                server.listen(); // announce-self under BLAKE2b(publicKey)
+                dht.announce(topic, keyPair, [ourUdxAddr]); // topic record
+            }
+            catch (Exception)
+            {
+            }
+            for (int i = 0; i < ticks && !destroyed; i++)
+                try
+                    sleep(100.msecs);
+                catch (Exception)
+                {
+                }
         }
     }
 
