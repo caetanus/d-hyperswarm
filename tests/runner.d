@@ -29,5 +29,6 @@ int main(string[] args)
         "tests.holepunch_messages_test",
         "tests.noise_wrap_test",
         "hyperswarm.connection",
+        "tests.connection_drain_test",
     );
 }
