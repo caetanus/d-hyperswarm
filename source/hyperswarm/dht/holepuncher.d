@@ -199,8 +199,19 @@ final class Holepuncher
     // CONSISTENT × CONSISTENT: slow volley at the peer's fixed mapping.
     private void consistentProbe() nothrow
     {
+        // Fast-open ping (hyperdht server.js does `await p.ping(peerAddress)` before
+        // the probe): fire one beacon immediately to OPEN our outbound NAT mapping
+        // toward the peer. This must happen BEFORE the responder's 1s pause below —
+        // otherwise the peer's inbound beacons reach our NAT first, and nf_nat forks
+        // our delayed outbound to a fresh external port (the responder-role rig fork:
+        // sample/advertise 50168, but the paused beacon egressed 40408). Opening the
+        // mapping first pins it to the advertised port so inbound matches.
+        foreach (a; remoteAddresses)
+            if (a.verified)
+                beacon(socket(), Address(a.host, 4, a.port), DEFAULT_TTL);
+
         if (!isInitiator)
-            sleeper.pause(1.seconds); // the server's fast-open ping already fired
+            sleeper.pause(1.seconds); // now safe: our mapping is already open
 
         int tries = 0;
         while (punching && tries++ < 10)
