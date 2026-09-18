@@ -70,6 +70,26 @@ final class Holepuncher
     /// Fired when the punch is abandoned without connecting.
     void delegate() nothrow onAbort;
 
+    /// Test seam: when set, every beacon is delivered here instead of hitting the
+    /// wire, so the RANDOM/birthday strategies (which no rig can reproduce without a
+    /// symmetric NAT) can be asserted without real sends. Null in production.
+    void delegate(void* sock, Address to, int ttl) nothrow onBeaconSent;
+
+    // All beacons funnel through here so the test seam sees every send.
+    private void beacon(void* sock, Address to, int ttl) nothrow
+    {
+        if (onBeaconSent !is null)
+            onBeaconSent(sock, to, ttl);
+        else
+            rpc.sendBeacon(sock, to, ttl);
+    }
+
+    /// Sockets currently held (holders.length), for tests asserting the birthday spray.
+    size_t holderCount() const nothrow
+    {
+        return holders.length;
+    }
+
     this(Rpc rpc, SocketPool pool, bool isInitiator, uint remoteFirewall = FW_UNKNOWN)
     {
         this.rpc = rpc;
@@ -177,7 +197,7 @@ final class Holepuncher
             {
                 if (!a.verified && (tries & 3) != 0)
                     continue; // unverified addrs only every 4th tick
-                rpc.sendBeacon(socket(), Address(a.host, 4, a.port), DEFAULT_TTL);
+                beacon(socket(), Address(a.host, 4, a.port), DEFAULT_TTL);
             }
             if (punching)
                 sleeper.pause(1.seconds);
@@ -191,7 +211,7 @@ final class Holepuncher
         int tries = 1750; // ~35s at 20ms
         while (punching && tries-- > 0)
         {
-            rpc.sendBeacon(socket(), Address(r.host, 4, randomPort()), DEFAULT_TTL);
+            beacon(socket(), Address(r.host, 4, randomPort()), DEFAULT_TTL);
             if (punching)
                 sleeper.pause(20.msecs);
         }
@@ -214,7 +234,7 @@ final class Holepuncher
                 if (lowTTLRounds > 0)
                     lowTTLRounds--;
             }
-            rpc.sendBeacon(holders[i++], Address(r.host, 4, r.port),
+            beacon(holders[i++], Address(r.host, 4, r.port),
                 lowTTLRounds > 0 ? HOLEPUNCH_TTL : DEFAULT_TTL);
             if (punching)
                 sleeper.pause(20.msecs);
@@ -234,7 +254,7 @@ final class Holepuncher
             catch (Exception)
                 return; // pool exhausted / bind failed — stop opening
             addRef(s);
-            rpc.sendBeacon(s, Address(r.host, 4, r.port), HOLEPUNCH_TTL);
+            beacon(s, Address(r.host, 4, r.port), HOLEPUNCH_TTL);
         }
     }
 
@@ -251,7 +271,7 @@ final class Holepuncher
         if (!isInitiator)
         {
             // Responder: reflect so the initiator's NAT sees return traffic.
-            rpc.sendBeacon(s, from, DEFAULT_TTL);
+            beacon(s, from, DEFAULT_TTL);
             return;
         }
         if (connected)
