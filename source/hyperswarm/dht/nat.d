@@ -180,12 +180,21 @@ import hyperswarm.dht.wire : FIND_NODE;
 Nat sampleNat(Rpc rpc, SocketPool pool, Address[] seeds, bool firewalled,
     size_t maxPings = Nat.minSamples, Duration timeout = 2.seconds)
 {
-    import std.random : uniform;
-
-    auto nat = new Nat(firewalled);
     auto sock = pool.acquire();
     scope (exit)
         pool.release(sock);
+    return sampleNatOn(rpc, sock, seeds, firewalled, maxPings, timeout);
+}
+
+/// Same walk as sampleNat, but on a socket the caller already holds (and keeps).
+/// The holepuncher uses this to learn its *holder* socket's external mapping — the
+/// exact host:port the peer must aim its beacons at — without swapping sockets.
+Nat sampleNatOn(Rpc rpc, void* sock, Address[] seeds, bool firewalled,
+    size_t maxPings = Nat.minSamples, Duration timeout = 2.seconds)
+{
+    import std.random : uniform;
+
+    auto nat = new Nat(firewalled);
 
     // FIND_NODE toward a fixed random target: its reply carries our observed `to`
     // (the NAT sample, independent of the command) AND closerNodes to walk, so the

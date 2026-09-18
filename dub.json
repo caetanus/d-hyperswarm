@@ -234,6 +234,20 @@
 				"source",
 				"interop/udx-dpeer"
 			]
+		},
+		{
+			"name": "holepunch-probe",
+			"targetType": "executable",
+			"targetName": "holepunch-probe",
+			"mainSourceFile": "interop/holepunch-probe/app.d",
+			"sourcePaths": [
+				"source",
+				"interop/holepunch-probe"
+			],
+			"importPaths": [
+				"source",
+				"interop/holepunch-probe"
+			]
 		}
 	]
 }
