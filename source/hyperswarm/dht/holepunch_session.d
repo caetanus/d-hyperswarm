@@ -107,6 +107,43 @@ final class HolepunchSession
         return nullable(payload.encrypt(reply));
     }
 
+    /// Client side, outgoing half of one round (hyperdht updateHolepunch's request):
+    /// seal our current NAT state to send to the server through the relay.
+    /// `remoteAddress` = where we currently think the server is (its advertised addr).
+    ubyte[] buildClientRound(Address remoteAddress)
+    {
+        HolepunchPayload m;
+        m.error = ERR_NONE;
+        m.firewall = puncher.nat.firewall;
+        m.round = round++;
+        m.connected = false;
+        m.punching = false;
+        m.addresses = puncher.nat.addresses;
+        m.hasRemoteAddress = remoteAddress.host.length != 0;
+        m.remoteAddress = remoteAddress;
+        return payload.encrypt(m);
+    }
+
+    /// Client side, incoming half of one round: process the server's sealed reply.
+    /// `replyTo`/`replyFrom` = the relay's view of us (a NAT sample). Returns false on
+    /// error/undecryptable (caller aborts), true to keep going. On success it learns
+    /// the server's firewall + addresses (verified-address / token-echo deferred, so
+    /// the peer addresses are probed rather than sprayed — fine for the CONSISTENT
+    /// path). Call puncher.punch() after, once both sides know each other.
+    bool applyReply(scope const(ubyte)[] sealed, Address replyTo, Address replyFrom)
+    {
+        auto rpn = payload.decrypt(sealed);
+        if (rpn.isNull)
+            return false;
+        auto remote = rpn.get;
+        if (remote.error != ERR_NONE)
+            return false;
+        auto p = puncher;
+        p.nat.add(replyTo, replyFrom); // our external as the relay observed us
+        p.updateRemote(remote.punching, remote.firewall, remote.addresses, null);
+        return true;
+    }
+
     /// Seal an abort reply and tear the puncher down.
     Nullable!(ubyte[]) abort(uint error = ERR_ABORTED)
     {

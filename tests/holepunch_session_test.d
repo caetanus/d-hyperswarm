@@ -17,6 +17,94 @@ import hyperswarm.dht.holepunch_session : HolepunchSession;
 import hyperswarm.dht.connect_messages : Holepunch, HolepunchPayload, decodeHolepunch,
     FW_CONSISTENT, FW_UNKNOWN, ERR_NONE;
 
+// --- round-trip (client build -> server handle -> client apply) ---
+private __gshared bool g_rtReplyOk;
+private __gshared bool g_rtApplyOk;
+private __gshared uint g_rtClientRemoteFw;
+private __gshared size_t g_rtClientRemoteAddrs;
+private __gshared uint g_rtServerRemoteFw;
+
+@("holepunch session: a full client<->server round-trip converges each side's remote state")
+unittest
+{
+    g_rtReplyOk = false;
+    g_rtApplyOk = false;
+    g_rtClientRemoteFw = 999;
+    g_rtClientRemoteAddrs = 0;
+    g_rtServerRemoteFw = 999;
+
+    runTask(() nothrow {
+        Rpc rpc;
+        SocketPool pool;
+        try
+        {
+            rpc = new Rpc(0);
+            pool = new SocketPool(rpc);
+            ubyte[32] secret = 9;
+
+            // remoteFirewall seeds are each side's guess of the other (both CONSISTENT).
+            auto server = new HolepunchSession(rpc, pool, secret, /*isInitiator*/ false, FW_CONSISTENT);
+            auto client = new HolepunchSession(rpc, pool, secret, /*isInitiator*/ true, FW_CONSISTENT);
+
+            // Make each side's own NAT verdict CONSISTENT with a stable external addr
+            // (3 responders agreeing), so the round advertises a real firewall+address.
+            foreach (i; 0 .. 3)
+            {
+                server.puncher.nat.add(Address("7.7.7.7", 4, 700),
+                    Address("8.8.8." ~ cast(char)('0' + cast(int) i), 4, 42));
+                client.puncher.nat.add(Address("3.3.3.3", 4, 300),
+                    Address("4.4.4." ~ cast(char)('0' + cast(int) i), 4, 42));
+            }
+
+            // 1. Client seals a round toward the server's address.
+            auto outbound = client.buildClientRound(Address("7.7.7.7", 4, 700));
+            Holepunch env;
+            env.id = 0;
+            env.hasPeerAddress = true;
+            env.peerAddress = Address("5.5.5.5", 4, 5555); // client's external (relay's view)
+            env.payload = outbound;
+
+            // 2. Server processes it and seals a reply.
+            auto reply = server.handleRound(env, Address("7.7.7.7", 4, 700),
+                Address("6.6.6.6", 4, 6666), /*viaOurSocket*/ false, /*isServerRelay*/ false);
+            g_rtServerRemoteFw = server.puncher.remoteFirewall;
+
+            if (!reply.isNull)
+            {
+                g_rtReplyOk = true;
+                // 3. Client applies the server's reply.
+                g_rtApplyOk = client.applyReply(reply.get, Address("5.5.5.5", 4, 5555),
+                    Address("6.6.6.6", 4, 6666));
+                g_rtClientRemoteFw = client.puncher.remoteFirewall;
+                g_rtClientRemoteAddrs = client.puncher.remoteAddresses.length;
+            }
+        }
+        catch (Exception)
+        {
+        }
+        try
+        {
+            if (rpc !is null)
+                rpc.close();
+        }
+        catch (Exception)
+        {
+        }
+        try
+            exitEventLoop();
+        catch (Exception)
+        {
+        }
+    });
+    runEventLoop();
+
+    g_rtServerRemoteFw.should.equal(FW_CONSISTENT); // server learned the client's verdict
+    g_rtReplyOk.should.equal(true);
+    g_rtApplyOk.should.equal(true);
+    g_rtClientRemoteFw.should.equal(FW_CONSISTENT); // client learned the server's verdict
+    g_rtClientRemoteAddrs.should.be.greaterThan(cast(size_t) 0); // + its advertised address
+}
+
 private __gshared bool g_replyPresent;
 private __gshared bool g_replyDecrypts;
 private __gshared uint g_replyError;
