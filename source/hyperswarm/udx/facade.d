@@ -29,6 +29,21 @@ import vibe.core.sync : LocalManualEvent, createManualEvent;
 import vibe.core.net : UDPConnection, NetworkAddress, listenUDP;
 import vibe.core.core : runTask;
 
+// Diagnostic: HS_UDX_SEND_TRACE=1 logs which send path fires and the real fd, to
+// catch a beacon leaving a different socket than the holder (holepunch rig).
+import core.stdc.stdio : fprintf, stderr;
+private __gshared int g_sendTrace = -1;
+private bool sendTraceOn() nothrow @trusted
+{
+    if (g_sendTrace < 0)
+    {
+        import core.stdc.stdlib : getenv;
+
+        g_sendTrace = getenv("HS_UDX_SEND_TRACE") !is null ? 1 : 0;
+    }
+    return g_sendTrace == 1;
+}
+
 // Linux socket-option constants not always surfaced by druntime imports.
 private enum int IP_TTL = 2;
 private enum int IPPROTO_IPV6 = 41;
@@ -633,6 +648,9 @@ int hsuv_udp_send(void* req, void* handle, const(uv_buf_t)* bufs, uint nbufs, co
         }
         auto peer = toNetworkAddress(cast(const(sockaddr)*) addr);
         auto conn = st.conn;
+        if (sendTraceOn())
+            fprintf(stderr, "[facade] SLOW udp_send fd=%d bound=%d\n", st.fd,
+                cast(int) conn.localAddress.port);
         runTask(() nothrow {
             int status = 0;
             try
@@ -660,6 +678,9 @@ int hsuv_udp_try_send(void* handle, const(uv_buf_t)* bufs, uint nbufs, const(voi
     msg.msg_iov = cast(iovec*) bufs; // uv_buf_t and iovec share layout
     msg.msg_iovlen = nbufs;
     immutable n = sendmsg(st.fd, &msg, MSG_DONTWAIT);
+    if (sendTraceOn())
+        fprintf(stderr, "[facade] try_send fd=%d n=%ld errno=%d\n", st.fd,
+            cast(long) n, n < 0 ? errno : 0);
     if (n < 0)
         return (errno == EAGAIN || errno == EWOULDBLOCK) ? UV_EAGAIN : -errno;
     return cast(int) n;
