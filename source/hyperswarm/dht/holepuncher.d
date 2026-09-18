@@ -75,13 +75,23 @@ final class Holepuncher
     /// symmetric NAT) can be asserted without real sends. Null in production.
     void delegate(void* sock, Address to, int ttl) nothrow onBeaconSent;
 
+    /// Diagnostic trace, non-suppressing: fired for every beacon this puncher sends
+    /// (sent=true) and receives (sent=false), so a harness can log the punch and
+    /// correlate it with a packet capture. Null in production; unlike onBeaconSent
+    /// it does NOT replace the real send.
+    void delegate(bool sent, Address addr, int ttl) nothrow onBeaconTrace;
+
     // All beacons funnel through here so the test seam sees every send.
     private void beacon(void* sock, Address to, int ttl) nothrow
     {
         if (onBeaconSent !is null)
-            onBeaconSent(sock, to, ttl);
-        else
-            rpc.sendBeacon(sock, to, ttl);
+        {
+            onBeaconSent(sock, to, ttl); // suppressing unit-test seam
+            return;
+        }
+        if (onBeaconTrace !is null)
+            onBeaconTrace(true, to, ttl);
+        rpc.sendBeacon(sock, to, ttl);
     }
 
     /// Sockets currently held (holders.length), for tests asserting the birthday spray.
@@ -268,6 +278,8 @@ final class Holepuncher
     // An inbound HOLEPUNCH beacon: proof the hole toward `from` is open.
     private void onBeacon(Address from, void* s) nothrow
     {
+        if (onBeaconTrace !is null)
+            onBeaconTrace(false, from, 0);
         if (!isInitiator)
         {
             // Responder: reflect so the initiator's NAT sees return traffic.

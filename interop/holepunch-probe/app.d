@@ -61,6 +61,9 @@ private Address parseAddr(string s)
 private __gshared string g_peerLine;
 private __gshared bool g_peerReady;
 
+// Touched only on the vibe loop thread (main fiber + keepalive fiber), so no lock.
+private __gshared bool g_keepAlive;
+
 private void readPeerLine() nothrow
 {
     try
@@ -132,6 +135,45 @@ int main(string[] args)
                 writeln("[", role, "] note: this rig leg only exercises the CONSISTENT path; got ",
                     fwName(nat.firewall));
 
+            // Trace every beacon sent/received, so a packet capture can be correlated
+            // with what the D puncher actually did.
+            hp.onBeaconTrace = (bool sent, Address addr, int ttl) nothrow {
+                try
+                {
+                    if (sent)
+                        writeln("[", role, "] SENT beacon -> ", addr.host, ":", addr.port, " ttl=", ttl);
+                    else
+                        writeln("[", role, "] RECV beacon <- ", addr.host, ":", addr.port);
+                }
+                catch (Exception)
+                {
+                }
+            };
+
+            // Keep the holder's NAT mapping alive during the (human-paced) exchange:
+            // an idle CONSISTENT socket can be re-mapped to a NEW external port, which
+            // would leave the peer aiming at the stale port we already printed. Refresh
+            // every ~4s (well inside a UDP conntrack idle timeout) until we punch.
+            g_keepAlive = true;
+            runTask(() nothrow {
+                while (g_keepAlive)
+                {
+                    try
+                        sampleNatOn(rpc, hp.socket(), seeds, true, 1, 2.seconds);
+                    catch (Exception)
+                    {
+                    }
+                    for (int k = 0; k < 40 && g_keepAlive; k++)
+                    {
+                        try
+                            sleep(100.msecs);
+                        catch (Exception)
+                        {
+                        }
+                    }
+                }
+            });
+
             // 2. Exchange: read the peer's mapping from stdin without parking the loop.
             write("PASTE PEER MAPPING (host:port) THEN ENTER: ");
             stdout.flush();
@@ -155,6 +197,20 @@ int main(string[] args)
                 exitEventLoop();
                 return;
             }
+
+            // Stop the keepalive and re-sample once: proves whether the mapping held.
+            // If it drifted, the peer is aiming at the wrong port — the punch can't work
+            // and this says so out loud.
+            g_keepAlive = false;
+            auto nat2 = sampleNatOn(rpc, hp.socket(), seeds, true, 4, 2.seconds);
+            if (nat2.addresses.length &&
+                (nat2.addresses[0].host != mine.host || nat2.addresses[0].port != mine.port))
+                writeln("[", role, "] WARNING: mapping DRIFTED ", mine.host, ":", mine.port, " -> ",
+                    nat2.addresses[0].host, ":", nat2.addresses[0].port,
+                    " during exchange — the peer is aiming at the OLD port, punch will miss!");
+            else
+                writeln("[", role, "] mapping held at ", mine.host, ":", mine.port, " (no drift)");
+
             writeln("[", role, "] punching toward ", peer.host, ":", peer.port, " ...");
 
             // 3. Punch. The exchange was manual+controlled, so the peer addr is trusted.
