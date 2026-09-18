@@ -95,6 +95,11 @@ final class Rpc
     // holepuncher via onBeacon). Empty on the main socket / plain rpc use.
     private void delegate(Address from) nothrow[void*] beaconCb;
 
+    /// Diagnostic tap: every datagram delivered (any socket, any size), before
+    /// demux. Null in production; a harness uses it to prove whether a packet
+    /// physically arrived at the socket vs was lost in transit.
+    void delegate(size_t len, Address from, void* viaSock) nothrow onRecvTrace;
+
     this(ushort bindPort = 0)
     {
         loop = new Loop();
@@ -297,6 +302,11 @@ final class Rpc
     {
         if (!running)
             return;
+        // Diagnostic: every datagram delivered to this Rpc, ANY size, before demux —
+        // so a harness can see raw arrivals independent of beacon/rpc routing (the
+        // traversal-vs-recv fork on a real NAT). Null in production.
+        if (onRecvTrace !is null)
+            onRecvTrace(got.length, addrFromSockaddr(from), viaSock);
         // 1-byte datagram = HOLEPUNCH beacon. Demux to this socket's puncher sink
         // (if any) rather than the dht-rpc parser.
         if (got.length == 1)

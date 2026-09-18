@@ -135,6 +135,20 @@ int main(string[] args)
                 writeln("[", role, "] note: this rig leg only exercises the CONSISTENT path; got ",
                     fwName(nat.firewall));
 
+            // Raw-arrival trace: EVERY datagram that reaches our socket, before demux.
+            // This is the traversal-vs-recv fork with no tcpdump/sudo needed — if the
+            // peer's beacon physically arrives we see "RAW recv len=1 from <peer>" even
+            // if something downstream drops it; if we never see it, it never traversed.
+            auto holderSock = hp.socket();
+            rpc.onRecvTrace = (size_t len, Address from, void* sock) nothrow {
+                try
+                    writeln("[", role, "] RAW recv len=", len, " from ", from.host, ":", from.port,
+                        sock is holderSock ? " (holder)" : " (main)");
+                catch (Exception)
+                {
+                }
+            };
+
             // Trace every beacon sent/received, so a packet capture can be correlated
             // with what the D puncher actually did.
             hp.onBeaconTrace = (bool sent, Address addr, int ttl) nothrow {
