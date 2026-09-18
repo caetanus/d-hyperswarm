@@ -31,5 +31,6 @@ int main(string[] args)
         "tests.noise_wrap_test",
         "hyperswarm.connection",
         "tests.connection_drain_test",
+        "tests.socket_pool_test",
     );
 }

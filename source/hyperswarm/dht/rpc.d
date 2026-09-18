@@ -35,7 +35,7 @@ extern (C) void hsRpcRecv(void* socket, ptrdiff_t len, const(uv_buf_t)* buf, con
     if (len <= 0)
         return;
     if (auto r = socket in g_rpcBySock)
-        r.onDatagram(cast(ubyte[]) buf.base[0 .. len], from);
+        r.onDatagram(cast(ubyte[]) buf.base[0 .. len], from, socket);
 }
 
 private Address addrFromSockaddr(const(void)* sa) nothrow
@@ -167,6 +167,20 @@ final class Rpc
         return sock.ptr;
     }
 
+    /// Register a pool socket (created on udxPtr) so its dht-rpc replies route to
+    /// this Rpc's pending map, and start receiving on it. The NAT sampler and the
+    /// holepuncher send from these to observe a per-socket external mapping.
+    package void registerPoolSocket(void* s) nothrow
+    {
+        g_rpcBySock[s] = this;
+        hs_udx_socket_recv_start(s, &hsRpcRecv);
+    }
+
+    package void unregisterPoolSocket(void* s) nothrow
+    {
+        g_rpcBySock.remove(s);
+    }
+
     void close()
     {
         running = false;
@@ -184,7 +198,7 @@ final class Rpc
     /// committing, the token from that node's earlier reply.
     Reply request(Address to, uint command, scope const(ubyte)[] target = null,
         scope const(ubyte)[] value = null, scope const(ubyte)[] token = null,
-        bool internal = true, Duration timeout = 2.seconds)
+        bool internal = true, Duration timeout = 2.seconds, void* viaSock = null)
     {
         immutable tid = nextTid++;
         if (nextTid == 0)
@@ -206,14 +220,14 @@ final class Rpc
         p.expectPort = to.port;
 
         immutable cnt = p.ev.emitCount;
-        sendResolved(req, na);
+        sendResolved(req, na, viaSock is null ? sock.ptr : viaSock);
         p.ev.wait(timeout, cnt);
         if (!p.got)
             throw new Exception("dht: request timed out");
         return p.reply;
     }
 
-    private void sendResolved(ubyte[] data, NetworkAddress na)
+    private void sendResolved(ubyte[] data, NetworkAddress na, void* viaSock)
     {
         auto sreq = new ubyte[](hs_udx_sizeof_socket_send());
         // keep the request block + payload alive past this call (udx references the
@@ -223,7 +237,7 @@ final class Rpc
         sendIdx = (sendIdx + 2) % SEND_RING;
 
         auto b = uv_buf_t(cast(char*) data.ptr, data.length);
-        hs_udx_socket_send(sreq.ptr, sock.ptr, &b, 1, cast(const(void)*) na.sockAddr, null);
+        hs_udx_socket_send(sreq.ptr, viaSock, &b, 1, cast(const(void)*) na.sockAddr, null);
     }
 
     /// Send a raw datagram to `to` (used to reply to a request). resolveHost handles
@@ -233,11 +247,11 @@ final class Rpc
     {
         auto na = resolveHost(to.host);
         na.port = to.port;
-        sendResolved(datagram, na);
+        sendResolved(datagram, na, sock.ptr);
     }
 
     // Called from the udx socket recv callback with one datagram.
-    package void onDatagram(ubyte[] got, const(void)* from) nothrow
+    package void onDatagram(ubyte[] got, const(void)* from, void* viaSock) nothrow
     {
         if (!running || got.length < 2)
             return;
@@ -269,7 +283,11 @@ final class Rpc
             auto src = addrFromSockaddr(from);
             if (src.port != p.expectPort || src.host != p.expectHost)
                 return;
-            recordSelf(r.to); // a verified node's view of our address
+            // Only the main socket's mapping is our advertised self-address; a
+            // pool socket's `to` is a per-socket sample the caller reads off the
+            // returned reply (the NAT sampler), and must not pollute _remoteAddr.
+            if (viaSock == sock.ptr)
+                recordSelf(r.to); // a verified node's view of our address
             p.reply = r;
             p.got = true;
             try
