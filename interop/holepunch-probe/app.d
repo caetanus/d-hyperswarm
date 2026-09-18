@@ -88,7 +88,8 @@ int main(string[] args)
 {
     string role = "initiator";
     string[] bootstrap;
-    auto help = getopt(args, "role", &role, "bootstrap", &bootstrap);
+    int probeSize = 0; // diagnostic: also send an N-byte marker each punch tick
+    auto help = getopt(args, "role", &role, "bootstrap", &bootstrap, "probe-size", &probeSize);
     if (help.helpWanted)
     {
         writeln("holepunch-probe --role initiator|responder [--bootstrap host:port]...");
@@ -251,6 +252,37 @@ int main(string[] args)
 
             hp.updateRemote(true, FW_CONSISTENT, [Address(peer.host, 4, peer.port)], peer.host);
             hp.punch();
+
+            // Optional diagnostic: alongside the 1-byte beacon, spray a larger marker
+            // datagram from the holder to the peer. If the peer's RAW recv shows the
+            // marker's length but never len=1, the CGNAT is dropping tiny UDP; if it
+            // shows neither, the path isn't opening at all (not a size issue).
+            if (probeSize > 0)
+            {
+                auto marker = new ubyte[probeSize];
+                marker[] = 0xFE; // distinct from dht-rpc REQUEST/RESPONSE ids
+                auto peerAddr = Address(peer.host, 4, peer.port);
+                runTask(() nothrow {
+                    while (!done)
+                    {
+                        rpc.sendRawFrom(hp.socket(), peerAddr, marker);
+                        try
+                            writeln("[", role, "] SENT probe len=", probeSize, " -> ",
+                                peerAddr.host, ":", peerAddr.port);
+                        catch (Exception)
+                        {
+                        }
+                        for (int k = 0; k < 5 && !done; k++)
+                        {
+                            try
+                                sleep(100.msecs);
+                            catch (Exception)
+                            {
+                            }
+                        }
+                    }
+                });
+            }
 
             // 4. Run up to ~45s. The responder never self-connects (it reflects), so a
             //    clean reflecting run is its success; the initiator flips result on SUCCESS.

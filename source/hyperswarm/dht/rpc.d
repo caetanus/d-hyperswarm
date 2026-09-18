@@ -228,6 +228,29 @@ final class Rpc
         }
     }
 
+    /// Diagnostic: send an arbitrary datagram from a specific socket (a pool holder)
+    /// to `to`. The rig harness uses it to test whether a LARGER UDP packet crosses a
+    /// NAT where the 1-byte beacon does not (carrier CGNATs sometimes drop tiny
+    /// datagrams). Never throws. Not part of the holepunch wire.
+    void sendRawFrom(void* viaSock, Address to, scope const(ubyte)[] data) nothrow
+    {
+        try
+        {
+            auto na = resolveHost(to.host);
+            na.port = to.port;
+            auto sreq = new ubyte[](hs_udx_sizeof_socket_send());
+            auto buf = data.dup;
+            sendKeep[sendIdx] = sreq;
+            sendKeep[(sendIdx + 1) % SEND_RING] = buf;
+            sendIdx = (sendIdx + 2) % SEND_RING;
+            auto b = uv_buf_t(cast(char*) buf.ptr, buf.length);
+            hs_udx_socket_send(sreq.ptr, viaSock, &b, 1, cast(const(void)*) na.sockAddr, null);
+        }
+        catch (Exception)
+        {
+        }
+    }
+
     void close()
     {
         running = false;
