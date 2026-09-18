@@ -18,6 +18,9 @@ import core.sys.posix.arpa.inet : htons, ntohs;
 
 extern (C) void poolSockClose(void* s) nothrow {}
 
+// The facade's fd accessor (uv_fileno). Diagnostic use.
+extern (C) int hsuv_fileno(const(void)* handle, int* fd) nothrow;
+
 final class SocketPool
 {
     private Rpc rpc;
@@ -82,5 +85,15 @@ final class SocketPool
         if (hs_udx_socket_getsockname(s, &ss, &sl) != 0)
             return 0;
         return ntohs((cast(sockaddr_in*)&ss).sin_port);
+    }
+
+    /// The OS fd backing a pool socket (uv_udp is the first field of udx_socket_t,
+    /// so the socket ptr is its uv handle). Diagnostic: to compare against a RAW
+    /// getsockname on the fd and catch a cached/stale localAddress on the send path.
+    int fileno(void* s) nothrow
+    {
+        int fd = -1;
+        cast(void) hsuv_fileno(s, &fd);
+        return fd;
     }
 }

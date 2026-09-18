@@ -34,6 +34,23 @@ private enum string[] defaultBootstrap = [
     "node2.hyperdht.org:49737",
 ];
 
+// A RAW getsockname(2) on the fd itself — bypasses vibe's possibly-cached
+// localAddress, to reveal the socket's real bound port. Diagnostic.
+private ushort rawFdPort(int fd) nothrow @trusted
+{
+    import core.sys.posix.sys.socket : getsockname, sockaddr, socklen_t;
+    import core.sys.posix.netinet.in_ : sockaddr_in;
+    import core.sys.posix.arpa.inet : ntohs;
+
+    if (fd < 0)
+        return 0;
+    sockaddr_in sa;
+    socklen_t sl = cast(socklen_t) sa.sizeof;
+    if (getsockname(fd, cast(sockaddr*)&sa, &sl) != 0)
+        return 0;
+    return ntohs(sa.sin_port);
+}
+
 private string fwName(uint f)
 {
     switch (f)
@@ -152,20 +169,24 @@ int main(string[] args)
                 }
             };
 
-            // The holder's INTERNAL bound port and the rpc main socket's port, so a
-            // beacon whose src doesn't match the holder is obvious at a glance.
-            writeln("[", role, "] holder internal port=", pool.boundPort(hp.socket()),
-                " main rpc port=", rpc.localPort);
+            // The holder's fd, its udx/vibe getsockname port, and a RAW getsockname on
+            // the fd. If the udx port and the raw-fd port disagree, vibe's localAddress
+            // is stale/cached while the real socket moved — the send-vs-getsockname split.
+            writeln("[", role, "] holder fd=", pool.fileno(hp.socket()),
+                " udxPort=", pool.boundPort(hp.socket()),
+                " rawFdPort=", rawFdPort(pool.fileno(hp.socket())),
+                " | main rpc port=", rpc.localPort);
 
-            // Trace every beacon sent/received. srcPort is the bound port of the socket
-            // the beacon actually LEFT from — if it != the holder internal port above,
-            // the send is going out a different fd than the sampled holder.
-            hp.onBeaconTrace = (bool sent, Address addr, int ttl, ushort srcPort) nothrow {
+            // Trace every beacon. srcPort = udx getsockname on the send socket; srcFd =
+            // its fd; and we raw-getsockname that fd. A beacon whose rawFdPort != the
+            // holder's rawFdPort is leaving a different real socket than we sampled.
+            hp.onBeaconTrace = (bool sent, Address addr, int ttl, ushort srcPort, int srcFd) nothrow {
                 try
                 {
                     if (sent)
-                        writeln("[", role, "] SENT beacon src=", srcPort, " -> ", addr.host, ":",
-                            addr.port, " ttl=", ttl);
+                        writeln("[", role, "] SENT beacon srcUdx=", srcPort, " fd=", srcFd,
+                            " rawFdPort=", rawFdPort(srcFd), " -> ", addr.host, ":", addr.port,
+                            " ttl=", ttl);
                     else
                         writeln("[", role, "] RECV beacon <- ", addr.host, ":", addr.port);
                 }
