@@ -6,6 +6,7 @@
 module hyperswarm.dht.node;
 
 import hyperswarm.dht.rpc : Rpc;
+import hyperswarm.dht.socket_pool : SocketPool;
 import hyperswarm.dht.wire : FIND_NODE, nodeId, Reply;
 import hyperswarm.dht.table : RoutingTable, Node, compareDistance;
 import hyperswarm.dht.messages : PeerRecord, Announce, encodeAnnounce, signAnnounce,
@@ -23,6 +24,7 @@ final class Dht
     RoutingTable table;
     ubyte[32] id;
     Address[] bootstrap;
+    private SocketPool _pool; // lazily created; the holepuncher's short-lived sockets
 
     this(Address[] bootstrap, ushort bindPort = 0)
     {
@@ -35,8 +37,19 @@ final class Dht
         this.bootstrap = bootstrap;
     }
 
+    /// The pool of short-lived udx sockets the holepuncher punches from (hyperdht's
+    /// dht._socketPool). Created on first use so a plain DHT node pays nothing for it.
+    SocketPool pool()
+    {
+        if (_pool is null)
+            _pool = new SocketPool(rpc);
+        return _pool;
+    }
+
     void close()
     {
+        if (_pool !is null)
+            _pool.closeAll();
         rpc.close();
     }
 
