@@ -144,6 +144,13 @@ final class Holepuncher
         remoteHolepunching = punching_;
     }
 
+    /// Send one default-TTL beacon to `addr` from the holder (hyperdht's p.ping): the
+    /// round's fast-open uses it to open our mapping toward a peer immediately.
+    void ping(Address addr) nothrow
+    {
+        beacon(socket(), addr, DEFAULT_TTL);
+    }
+
     private bool isVerified(string host) nothrow
     {
         foreach (a; remoteAddresses)

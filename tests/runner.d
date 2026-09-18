@@ -36,5 +36,6 @@ int main(string[] args)
         "tests.secure_payload_test",
         "tests.holepuncher_test",
         "tests.random_punch_test",
+        "tests.holepunch_session_test",
     );
 }

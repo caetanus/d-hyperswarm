@@ -19,6 +19,15 @@ enum : uint
     FW_RANDOM = 3
 }
 
+// holepunch round error codes (constants.js ERROR)
+enum : uint
+{
+    ERR_NONE = 0,
+    ERR_ABORTED = 1,
+    ERR_VERSION_MISMATCH = 2,
+    ERR_TRY_LATER = 3
+}
+
 // ── handshake envelope ───────────────────────────────────────────────────────
 
 struct Handshake
