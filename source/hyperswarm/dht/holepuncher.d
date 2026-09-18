@@ -77,9 +77,11 @@ final class Holepuncher
 
     /// Diagnostic trace, non-suppressing: fired for every beacon this puncher sends
     /// (sent=true) and receives (sent=false), so a harness can log the punch and
-    /// correlate it with a packet capture. Null in production; unlike onBeaconSent
+    /// correlate it with a packet capture. `srcPort` is the bound port of the socket
+    /// the beacon actually leaves from (0 on receive) — to catch a send going out a
+    /// different fd than the sampled holder. Null in production; unlike onBeaconSent
     /// it does NOT replace the real send.
-    void delegate(bool sent, Address addr, int ttl) nothrow onBeaconTrace;
+    void delegate(bool sent, Address addr, int ttl, ushort srcPort) nothrow onBeaconTrace;
 
     // All beacons funnel through here so the test seam sees every send.
     private void beacon(void* sock, Address to, int ttl) nothrow
@@ -90,7 +92,7 @@ final class Holepuncher
             return;
         }
         if (onBeaconTrace !is null)
-            onBeaconTrace(true, to, ttl);
+            onBeaconTrace(true, to, ttl, pool.boundPort(sock));
         rpc.sendBeacon(sock, to, ttl);
     }
 
@@ -279,7 +281,7 @@ final class Holepuncher
     private void onBeacon(Address from, void* s) nothrow
     {
         if (onBeaconTrace !is null)
-            onBeaconTrace(false, from, 0);
+            onBeaconTrace(false, from, 0, 0);
         if (!isInitiator)
         {
             // Responder: reflect so the initiator's NAT sees return traffic.

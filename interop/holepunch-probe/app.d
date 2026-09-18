@@ -152,13 +152,20 @@ int main(string[] args)
                 }
             };
 
-            // Trace every beacon sent/received, so a packet capture can be correlated
-            // with what the D puncher actually did.
-            hp.onBeaconTrace = (bool sent, Address addr, int ttl) nothrow {
+            // The holder's INTERNAL bound port and the rpc main socket's port, so a
+            // beacon whose src doesn't match the holder is obvious at a glance.
+            writeln("[", role, "] holder internal port=", pool.boundPort(hp.socket()),
+                " main rpc port=", rpc.localPort);
+
+            // Trace every beacon sent/received. srcPort is the bound port of the socket
+            // the beacon actually LEFT from — if it != the holder internal port above,
+            // the send is going out a different fd than the sampled holder.
+            hp.onBeaconTrace = (bool sent, Address addr, int ttl, ushort srcPort) nothrow {
                 try
                 {
                     if (sent)
-                        writeln("[", role, "] SENT beacon -> ", addr.host, ":", addr.port, " ttl=", ttl);
+                        writeln("[", role, "] SENT beacon src=", srcPort, " -> ", addr.host, ":",
+                            addr.port, " ttl=", ttl);
                     else
                         writeln("[", role, "] RECV beacon <- ", addr.host, ":", addr.port);
                 }
