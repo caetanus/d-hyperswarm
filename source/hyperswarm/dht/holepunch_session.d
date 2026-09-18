@@ -110,14 +110,16 @@ final class HolepunchSession
     /// Client side, outgoing half of one round (hyperdht updateHolepunch's request):
     /// seal our current NAT state to send to the server through the relay.
     /// `remoteAddress` = where we currently think the server is (its advertised addr).
-    ubyte[] buildClientRound(Address remoteAddress)
+    /// `punching` announces we're about to punch (probe rounds send false to exchange
+    /// NAT state first; the punch round sends true so the server punches with us).
+    ubyte[] buildClientRound(Address remoteAddress, bool punching = false)
     {
         HolepunchPayload m;
         m.error = ERR_NONE;
         m.firewall = puncher.nat.firewall;
         m.round = round++;
         m.connected = false;
-        m.punching = false;
+        m.punching = punching;
         m.addresses = puncher.nat.addresses;
         m.hasRemoteAddress = remoteAddress.host.length != 0;
         m.remoteAddress = remoteAddress;

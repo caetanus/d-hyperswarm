@@ -9,9 +9,10 @@ module hyperswarm.dht.connect;
 import hyperswarm.dht.node : Dht;
 import hyperswarm.dht.table : Node;
 import hyperswarm.dht.noise_wrap : NoiseWrap, HandshakeResult;
-import hyperswarm.dht.connect_messages : Handshake, NoisePayload, UdxInfo, FW_OPEN,
-    encodeHandshake, decodeHandshake;
-import hyperswarm.dht.messages : HS_FIND_PEER, HS_PEER_HANDSHAKE;
+import hyperswarm.dht.connect_messages : Handshake, NoisePayload, UdxInfo, Holepunch,
+    FW_OPEN, FW_UNKNOWN, encodeHandshake, decodeHandshake, encodeHolepunch, decodeHolepunch;
+import hyperswarm.dht.holepunch_session : HolepunchSession;
+import hyperswarm.dht.messages : HS_FIND_PEER, HS_PEER_HANDSHAKE, HS_PEER_HOLEPUNCH;
 import hyperswarm.noise.crypto : keyedBlake2b, Keypair;
 import hyperswarm.cenc : Address;
 import core.time : Duration, seconds;
@@ -27,13 +28,15 @@ struct ConnectHandshake
     Address serverAddress;
     NoisePayload serverPayload;
     uint ourUdxId;
+    Address relayAddress; // the node that relayed the handshake — reused for PEER_HOLEPUNCH
 }
 
 /// Run the peer handshake for connect(publicKey): find a relay via FIND_PEER, send a
 /// PEER_HANDSHAKE carrying the IK msg1 + our noisePayload, and complete the handshake
 /// from the server's reply.
 ConnectHandshake connectHandshake(Dht dht, ubyte[32] publicKey, Keypair keyPair,
-    Address ourAddress, uint ourUdxId, Duration per = 3.seconds)
+    Address ourAddress, uint ourUdxId, Duration per = 3.seconds,
+    uint ourFirewall = FW_OPEN, Address[] ourAddresses = null)
 {
     ubyte[32] target;
     keyedBlake2b(target[], publicKey[], []); // target = BLAKE2b(publicKey)
@@ -57,11 +60,14 @@ ConnectHandshake connectHandshake(Dht dht, ubyte[32] publicKey, Keypair keyPair,
     if (!haveRelay)
         throw new Exception("connect: peer not found");
 
-    // IK handshake (initiator knows the server's static key) carrying our connect info
+    // IK handshake (initiator knows the server's static key) carrying our connect info.
+    // ourFirewall/ourAddresses default to OPEN + [ourAddress] (the direct path); a
+    // firewalled client samples its NAT first and passes the real verdict so the
+    // server advertises holepunch instead of the OPEN shortcut.
     auto wrap = new NoiseWrap(keyPair, publicKey[]);
     NoisePayload p;
-    p.firewall = FW_OPEN;
-    p.addresses4 = [ourAddress];
+    p.firewall = ourFirewall;
+    p.addresses4 = ourAddresses.length ? ourAddresses : [ourAddress];
     p.hasUdx = true;
     p.udx = UdxInfo(1, false, ourUdxId, 0);
     p.hasSecretStream = true;
@@ -87,7 +93,8 @@ ConnectHandshake connectHandshake(Dht dht, ubyte[32] publicKey, Keypair keyPair,
     auto serverPayload = wrap.recv(rhs.noise);
     auto result = wrap.finish();
     Address serverAddress = rhs.hasPeerAddress ? rhs.peerAddress : Address(relay.host, 4, relay.port);
-    return ConnectHandshake(result, serverAddress, serverPayload, ourUdxId);
+    return ConnectHandshake(result, serverAddress, serverPayload, ourUdxId,
+        Address(relay.host, 4, relay.port));
 }
 
 /// Connect directly to a server at a known address (skip FIND_PEER): send the
@@ -122,5 +129,62 @@ ConnectHandshake connectHandshakeTo(Dht dht, ubyte[32] publicKey, Keypair keyPai
 
     auto serverPayload = wrap.recv(rhs.noise);
     auto result = wrap.finish();
-    return ConnectHandshake(result, serverAddr, serverPayload, ourUdxId);
+    return ConnectHandshake(result, serverAddr, serverPayload, ourUdxId, serverAddr);
+}
+
+/// Run the client PEER_HOLEPUNCH round loop for a holepunchable server (its noise
+/// payload had hasHolepunch). Port of connect.js probeRound/roundPunch, simplified to
+/// the CONSISTENT path (analyze/reopen, TRY_LATER and the random-punch gate deferred):
+///   - a probe round (punching=false) to exchange NAT state through the relay,
+///   - once we know the server's verdict, a punch round (punching=true) so the server
+///     punches with us, then p.punch() locally.
+/// The rounds carry the same round number both ways, giving the simultaneity that
+/// `--fire-at` faked. `session` is a HolepunchSession(isInitiator=true) whose puncher
+/// has already sample()d. onConnect (wired by the caller, E3) fires on success.
+void connectHolepunch(Dht dht, HolepunchSession session, ConnectHandshake ch,
+    ubyte[32] target, Address ourExternal, Duration per = 3.seconds)
+{
+    auto p = session.puncher;
+    immutable id = ch.serverPayload.holepunch.id;
+    immutable relayAddr = ch.relayAddress;
+    immutable serverAddr = ch.serverAddress;
+
+    bool sendRound(bool punching)
+    {
+        if (p.connected || p.destroyed)
+            return false;
+        Holepunch env;
+        env.mode = FROM_CLIENT;
+        env.id = id;
+        env.hasPeerAddress = true;
+        env.peerAddress = ourExternal; // our external, so the server can aim back
+        env.payload = session.buildClientRound(serverAddr, punching);
+        try
+        {
+            auto reply = dht.rpc.request(relayAddr, HS_PEER_HOLEPUNCH, target[],
+                encodeHolepunch(env), null, false, per);
+            if (reply.value.length == 0)
+                return false;
+            auto rEnv = decodeHolepunch(reply.value);
+            return session.applyReply(rEnv.payload, reply.to, relayAddr);
+        }
+        catch (Exception)
+            return false;
+    }
+
+    // Probe rounds: exchange NAT state until we've learned the server's verdict.
+    foreach (_; 0 .. 4)
+    {
+        if (!sendRound(false))
+            return;
+        if (p.remoteFirewall != FW_UNKNOWN && p.remoteAddresses.length)
+            break;
+    }
+    if (p.remoteFirewall == FW_UNKNOWN || !p.remoteAddresses.length)
+        return; // never converged — abort
+
+    // Punch round: tell the server we're punching, then punch (the round number aligns
+    // both sides, so neither is the nf_nat second-mover).
+    sendRound(true);
+    p.punch();
 }
