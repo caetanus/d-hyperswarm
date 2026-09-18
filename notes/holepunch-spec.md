@@ -49,3 +49,13 @@ C. nat.d sampler — unit (synthetic add() per branch) + live 4-ping classificat
 D. secure_payload.d + holepuncher.d core — loopback two-puncher CONSISTENT×CONSISTENT → onconnect; assert TTLs.
 E. wire into connect.d/serve.d + HS_PEER_HOLEPUNCH — D↔D one host through punch path; D↔JS decrypt rounds.
 F. real two-NAT interop (rig): all NAT pairs, random-punch gate, tryLater; router.d only if pure-D-relay needed.
+
+## Rig coverage / test strategy (ground-truth from the real-NAT rig, 2026-09-17)
+Both rig endpoints measured CONSISTENT (endpoint-independent, port-preserving mapping):
+- desktop CGNAT (public 181.233.106.5): identical external port across 5 STUN servers, port-preserving. → CONSISTENT. (The restriction is on FILTERING, not mapping — earlier "RANDOM-ish" was wrong.)
+- server netns-MASQUERADE (62.238.38.245): identical across 5, port-preserving (Linux MASQUERADE default). → CONSISTENT.
+Implications:
+- Stage C sampler acceptance: it should classify BOTH endpoints CONSISTENT (from ≥4 DHT pings). That's the live check.
+- Stage F rig validates ONLY the CONSISTENT × CONSISTENT punch path (_consistentProbe: predictable ports, round-synced, TTL 64, 10 tries × 1000ms). NOT the RANDOM/birthday path.
+- The RANDOM side (≥RANDOM × CONSISTENT → _openBirthdaySockets 256 + _keepAliveRandomNat; CONSISTENT × ≥RANDOM → _randomProbes) CANNOT be reproduced on this rig (no symmetric NAT available). It MUST get unit coverage in Stage D (drive a Holepuncher with a coerced RANDOM firewall; assert 256 holders acquired, randomPort() range [1000,65536), the TTL-5-first sweep, the 20ms cadence) — do not rely on the rig for it.
+- Ports are ephemeral (CGNAT re-maps); the peer re-runs a live natcheck for current ports the moment the sampler is testable.
