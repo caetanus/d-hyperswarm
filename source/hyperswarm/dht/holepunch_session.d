@@ -35,6 +35,15 @@ final class HolepunchSession
         payload = new SecurePayload(holepunchSecret);
     }
 
+    /// Wrap a puncher that already exists (the client samples its NAT before the
+    /// handshake to advertise its firewall, then learns the holepunchSecret from the
+    /// handshake reply and assembles the session around that same puncher).
+    this(Holepuncher puncher, SecurePayload payload)
+    {
+        this.puncher = puncher;
+        this.payload = payload;
+    }
+
     /// Sample our own external mapping + NAT verdict off the DHT before the round
     /// (server does this when it registers the session; client after the handshake).
     void sample(Address[] seeds, Duration timeout = 2.seconds)

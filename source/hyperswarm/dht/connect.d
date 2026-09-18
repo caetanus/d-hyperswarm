@@ -221,3 +221,60 @@ Connection formPunchedConnection(Dht dht, void* punchedSocket, Address peer, Con
     conn.start(); // our secret-stream setup frame, over the punched hole
     return conn;
 }
+
+/// High-level connect-by-key over a holepunch (ties E2 + E3): sample our NAT, run the
+/// handshake advertising our real firewall, and — if the server is holepunchable —
+/// run the round loop and form the connection over the hole. Returns the Connection,
+/// or null if the server is directly reachable (caller uses the OPEN path) or the
+/// punch times out. Automatic sync (the round number) replaces --fire-at.
+Connection connectViaHolepunch(Dht dht, ubyte[32] publicKey, Keypair keyPair,
+    Address ourAddress, uint ourUdxId, Duration per = 3.seconds,
+    Duration punchTimeout = 30.seconds)
+{
+    import hyperswarm.dht.holepuncher : Holepuncher;
+    import hyperswarm.dht.secure_payload : SecurePayload;
+    import vibe.core.core : sleep;
+    import core.time : msecs;
+
+    ubyte[32] target;
+    keyedBlake2b(target[], publicKey[], []);
+
+    // Sample our NAT first, so the handshake advertises our real firewall + address
+    // (which makes the server advertise holepunch instead of the OPEN shortcut).
+    auto puncher = new Holepuncher(dht.rpc, dht.pool, /*isInitiator*/ true, FW_UNKNOWN);
+    puncher.sample(dht.bootstrap);
+
+    auto ch = connectHandshake(dht, publicKey, keyPair, ourAddress, ourUdxId, per,
+        puncher.localFirewall, puncher.nat.addresses);
+
+    if (!ch.serverPayload.hasHolepunch)
+    {
+        puncher.destroy();
+        return null; // server is directly reachable — caller takes the OPEN path
+    }
+
+    // The hole opening fires onConnect(punchedSocket, peer); form the connection there.
+    Connection conn;
+    puncher.onConnect = (void* sock, Address peer) nothrow {
+        try
+            conn = formPunchedConnection(dht, sock, peer, ch);
+        catch (Exception)
+        {
+        }
+    };
+
+    puncher.remoteFirewall = ch.serverPayload.firewall;
+    auto session = new HolepunchSession(puncher, new SecurePayload(ch.hs.holepunchSecret));
+
+    auto ourExternal = puncher.nat.addresses.length ? puncher.nat.addresses[0] : ourAddress;
+    connectHolepunch(dht, session, ch, target, ourExternal, per); // rounds + punch()
+
+    immutable steps = cast(int)(punchTimeout.total!"msecs" / 100);
+    foreach (_; 0 .. steps)
+    {
+        if (conn !is null)
+            break;
+        sleep(100.msecs);
+    }
+    return conn; // null on timeout
+}
