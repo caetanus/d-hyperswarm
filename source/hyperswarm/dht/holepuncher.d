@@ -19,7 +19,7 @@
 /// UDX stream over the punched hole is wired on top in connect.d (Stage E).
 module hyperswarm.dht.holepuncher;
 
-import core.time : msecs, seconds;
+import core.time : Duration, msecs, seconds;
 import std.random : uniform;
 
 import vibe.core.core : runTask;
@@ -28,6 +28,7 @@ import hyperswarm.cenc : Address;
 import hyperswarm.dht.rpc : Rpc;
 import hyperswarm.dht.socket_pool : SocketPool;
 import hyperswarm.dht.sleeper : Sleeper;
+import hyperswarm.dht.nat : Nat, sampleNatOn;
 import hyperswarm.dht.connect_messages : FW_UNKNOWN, FW_OPEN, FW_CONSISTENT, FW_RANDOM;
 
 enum size_t BIRTHDAY_SOCKETS = 256;
@@ -54,7 +55,8 @@ final class Holepuncher
     private void*[] holders; // pool sockets we punch from; holders[0] is primary
 
     bool isInitiator;
-    uint localFirewall = FW_UNKNOWN; // set from nat.d's verdict before punch()
+    Nat nat; // our own NAT: sampled off the holder + fed by the round (p.nat in hyperdht)
+    uint localFirewall = FW_UNKNOWN; // punch driver; sample() sets it from nat's verdict
     uint remoteFirewall = FW_UNKNOWN;
     RemoteAddr[] remoteAddresses;
     bool remoteHolepunching;
@@ -109,6 +111,7 @@ final class Holepuncher
         this.isInitiator = isInitiator;
         this.remoteFirewall = remoteFirewall;
         this.sleeper = new Sleeper();
+        this.nat = new Nat(true); // firewalled until sampling proves otherwise
         addRef(pool.acquire());
     }
 
@@ -116,6 +119,16 @@ final class Holepuncher
     void* socket() nothrow
     {
         return holders[0];
+    }
+
+    /// Learn our own external mapping + NAT verdict by walking the DHT from the holder
+    /// socket (hyperdht's nat.autoSample). Sets nat + localFirewall, so the round can
+    /// advertise nat.addresses and punch() dispatches on the verdict. Call before punch.
+    void sample(Address[] seeds, Duration timeout = 2.seconds)
+    {
+        nat = sampleNatOn(rpc, socket(), seeds, /*firewalled*/ true, Nat.minSamples, timeout);
+        if (nat.firewall != FW_UNKNOWN)
+            localFirewall = nat.firewall;
     }
 
     /// Record what the peer told us over the DHT: are they punching, their NAT
