@@ -89,7 +89,9 @@ int main(string[] args)
     string role = "initiator";
     string[] bootstrap;
     int probeSize = 0; // diagnostic: also send an N-byte marker each punch tick
-    auto help = getopt(args, "role", &role, "bootstrap", &bootstrap, "probe-size", &probeSize);
+    bool keepAlive = false; // OFF by default: a concurrent DHT flow splits the punch port
+    auto help = getopt(args, "role", &role, "bootstrap", &bootstrap,
+        "probe-size", &probeSize, "keepalive", &keepAlive);
     if (help.helpWanted)
     {
         writeln("holepunch-probe --role initiator|responder [--bootstrap host:port]...");
@@ -165,29 +167,37 @@ int main(string[] args)
                 }
             };
 
-            // Keep the holder's NAT mapping alive during the (human-paced) exchange:
-            // an idle CONSISTENT socket can be re-mapped to a NEW external port, which
-            // would leave the peer aiming at the stale port we already printed. Refresh
-            // every ~4s (well inside a UDP conntrack idle timeout) until we punch.
-            g_keepAlive = true;
-            runTask(() nothrow {
-                while (g_keepAlive)
-                {
-                    try
-                        sampleNatOn(rpc, hp.socket(), seeds, true, 1, 2.seconds);
-                    catch (Exception)
-                    {
-                    }
-                    for (int k = 0; k < 40 && g_keepAlive; k++)
+            // Keepalive is OFF by default. It re-pings the DHT from the holder to stop
+            // the mapping going stale — but that holds the holder->DHT flow ACTIVE, and
+            // on a MASQUERADE NAT the concurrent holder->peer punch flow then forks a
+            // DIFFERENT external port (pcap: sampled 47613 toward DHT, egressed 26992
+            // toward the peer) so the peer aims at the wrong port. So the fix is the
+            // opposite of the staleness patch: keep a SINGLE flow from the holder. The
+            // sample's conntrack entry (assured, ~120s) holds the mapping through a
+            // quick paste, and port-preservation reuses it for the peer flow. --keepalive
+            // re-enables the old behaviour for A/B comparison.
+            if (keepAlive)
+            {
+                g_keepAlive = true;
+                runTask(() nothrow {
+                    while (g_keepAlive)
                     {
                         try
-                            sleep(100.msecs);
+                            sampleNatOn(rpc, hp.socket(), seeds, true, 1, 2.seconds);
                         catch (Exception)
                         {
                         }
+                        for (int k = 0; k < 40 && g_keepAlive; k++)
+                        {
+                            try
+                                sleep(100.msecs);
+                            catch (Exception)
+                            {
+                            }
+                        }
                     }
-                }
-            });
+                });
+            }
 
             // 2. Exchange: read the peer's mapping from stdin without parking the loop.
             write("PASTE PEER MAPPING (host:port) THEN ENTER: ");
@@ -213,20 +223,24 @@ int main(string[] args)
                 return;
             }
 
-            // Stop the keepalive and re-sample once: proves whether the mapping held.
-            // If it drifted, the peer is aiming at the wrong port — the punch can't work
-            // and this says so out loud.
-            g_keepAlive = false;
-            auto nat2 = sampleNatOn(rpc, hp.socket(), seeds, true, 4, 2.seconds);
-            if (nat2.addresses.length &&
-                (nat2.addresses[0].host != mine.host || nat2.addresses[0].port != mine.port))
-                writeln("[", role, "] WARNING: mapping DRIFTED ", mine.host, ":", mine.port, " -> ",
-                    nat2.addresses[0].host, ":", nat2.addresses[0].port,
-                    " during exchange — the peer is aiming at the OLD port, punch will miss!");
-            else
-                writeln("[", role, "] mapping held at ", mine.host, ":", mine.port, " (no drift)");
+            // Only when keepalive was on do we re-sample to check drift — the re-sample
+            // itself opens fresh holder->DHT flows, which is exactly the concurrency that
+            // splits the port, so we must NOT do it on the default single-flow path.
+            if (keepAlive)
+            {
+                g_keepAlive = false;
+                auto nat2 = sampleNatOn(rpc, hp.socket(), seeds, true, 4, 2.seconds);
+                if (nat2.addresses.length &&
+                    (nat2.addresses[0].host != mine.host || nat2.addresses[0].port != mine.port))
+                    writeln("[", role, "] WARNING: mapping DRIFTED ", mine.host, ":", mine.port, " -> ",
+                        nat2.addresses[0].host, ":", nat2.addresses[0].port,
+                        " during exchange — the peer is aiming at the OLD port, punch will miss!");
+                else
+                    writeln("[", role, "] mapping held at ", mine.host, ":", mine.port, " (no drift)");
+            }
 
-            writeln("[", role, "] punching toward ", peer.host, ":", peer.port, " ...");
+            writeln("[", role, "] punching toward ", peer.host, ":", peer.port,
+                " (single-flow, keepalive=", keepAlive, ") ...");
 
             // 3. Punch. The exchange was manual+controlled, so the peer addr is trusted.
             bool done;
