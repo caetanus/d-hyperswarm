@@ -12,9 +12,9 @@ module hyperswarm.dht.socket_pool;
 import hyperswarm.dht.rpc : Rpc;
 import hyperswarm.udx.udx;
 
-import core.sys.posix.sys.socket : sockaddr, AF_INET;
+import core.sys.posix.sys.socket : sockaddr, sockaddr_storage, AF_INET;
 import core.sys.posix.netinet.in_ : sockaddr_in;
-import core.sys.posix.arpa.inet : htons;
+import core.sys.posix.arpa.inet : htons, ntohs;
 
 extern (C) void poolSockClose(void* s) nothrow {}
 
@@ -70,5 +70,17 @@ final class SocketPool
     size_t count() const @safe pure nothrow
     {
         return acquired.length;
+    }
+
+    /// The ephemeral port a pool socket was bound to. Used to tell a peer where to
+    /// punch (paired with our sampled external host) and to target a loopback peer
+    /// in tests. 0 if getsockname fails.
+    ushort boundPort(void* s) nothrow
+    {
+        sockaddr_storage ss;
+        int sl = cast(int) ss.sizeof;
+        if (hs_udx_socket_getsockname(s, &ss, &sl) != 0)
+            return 0;
+        return ntohs((cast(sockaddr_in*)&ss).sin_port);
     }
 }

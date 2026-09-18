@@ -34,5 +34,6 @@ int main(string[] args)
         "tests.socket_pool_test",
         "tests.nat_test",
         "tests.secure_payload_test",
+        "tests.holepuncher_test",
     );
 }

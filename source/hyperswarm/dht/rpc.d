@@ -91,6 +91,10 @@ final class Rpc
     private ubyte[][] sendKeep;
     private size_t sendIdx;
 
+    // Per-pool-socket sink for 1-byte HOLEPUNCH beacons (installed by the
+    // holepuncher via onBeacon). Empty on the main socket / plain rpc use.
+    private void delegate(Address from) nothrow[void*] beaconCb;
+
     this(ushort bindPort = 0)
     {
         loop = new Loop();
@@ -179,6 +183,44 @@ final class Rpc
     package void unregisterPoolSocket(void* s) nothrow
     {
         g_rpcBySock.remove(s);
+        beaconCb.remove(s);
+    }
+
+    /// Install the holepunch-beacon sink for a pool socket. A 1-byte datagram on
+    /// that socket (the HOLEPUNCH `[0x00]`) is delivered here instead of being
+    /// parsed as dht-rpc; anything >=2 bytes still goes to the rpc path. Passing
+    /// null clears it.
+    package void onBeacon(void* s, void delegate(Address from) nothrow cb) nothrow
+    {
+        if (cb is null)
+            beaconCb.remove(s);
+        else
+            beaconCb[s] = cb;
+    }
+
+    /// Send the 1-byte HOLEPUNCH beacon `[0x00]` to `to` from `viaSock` at the given
+    /// UDP TTL: HOLEPUNCH_TTL (5) for a punch probe that must open our NAT without
+    /// yet reaching the peer, DEFAULT_TTL (64) once we want it to land. Never throws
+    /// — the holepuncher fires these from background fibers where a send must not
+    /// abort the round (matches holepuncher.js's "never fails").
+    package void sendBeacon(void* viaSock, Address to, int ttl) nothrow
+    {
+        try
+        {
+            auto na = resolveHost(to.host);
+            na.port = to.port;
+            auto sreq = new ubyte[](hs_udx_sizeof_socket_send());
+            auto data = [cast(ubyte) 0];
+            sendKeep[sendIdx] = sreq;
+            sendKeep[(sendIdx + 1) % SEND_RING] = data;
+            sendIdx = (sendIdx + 2) % SEND_RING;
+            auto b = uv_buf_t(cast(char*) data.ptr, data.length);
+            hs_udx_socket_send_ttl(sreq.ptr, viaSock, &b, 1,
+                cast(const(void)*) na.sockAddr, ttl, null);
+        }
+        catch (Exception)
+        {
+        }
     }
 
     void close()
@@ -253,7 +295,17 @@ final class Rpc
     // Called from the udx socket recv callback with one datagram.
     package void onDatagram(ubyte[] got, const(void)* from, void* viaSock) nothrow
     {
-        if (!running || got.length < 2)
+        if (!running)
+            return;
+        // 1-byte datagram = HOLEPUNCH beacon. Demux to this socket's puncher sink
+        // (if any) rather than the dht-rpc parser.
+        if (got.length == 1)
+        {
+            if (auto cb = viaSock in beaconCb)
+                (*cb)(addrFromSockaddr(from));
+            return;
+        }
+        if (got.length < 2)
             return;
         // dup: decoded fields slice into the packet, and the recv buffer is reused —
         // the decoded message must own its bytes past this callback.
