@@ -203,6 +203,9 @@ final class Rpc
             beaconCb[s] = cb;
     }
 
+    // udx binds every socket at UDX_DEFAULT_TTL, so a plain send already carries it.
+    private enum int UDX_DEFAULT_TTL = 64;
+
     /// Send the 1-byte HOLEPUNCH beacon `[0x00]` to `to` from `viaSock` at the given
     /// UDP TTL: HOLEPUNCH_TTL (5) for a punch probe that must open our NAT without
     /// yet reaching the peer, DEFAULT_TTL (64) once we want it to land. Never throws
@@ -220,8 +223,18 @@ final class Rpc
             sendKeep[(sendIdx + 1) % SEND_RING] = data;
             sendIdx = (sendIdx + 2) % SEND_RING;
             auto b = uv_buf_t(cast(char*) data.ptr, data.length);
-            hs_udx_socket_send_ttl(sreq.ptr, viaSock, &b, 1,
-                cast(const(void)*) na.sockAddr, ttl, null);
+            // TTL 64 is udx's own socket default, so a plain send already carries it —
+            // and it avoids udx_socket_send_ttl's specific-ttl-send-queue machinery,
+            // which on a real port-preserving NAT was observed egressing the beacon
+            // from a stray socket instead of the holder (the rig punch bug: getsockname
+            // said the holder, the datagram left a third port). Only the low priming
+            // TTL (5) needs the per-packet override.
+            if (ttl == UDX_DEFAULT_TTL)
+                hs_udx_socket_send(sreq.ptr, viaSock, &b, 1,
+                    cast(const(void)*) na.sockAddr, null);
+            else
+                hs_udx_socket_send_ttl(sreq.ptr, viaSock, &b, 1,
+                    cast(const(void)*) na.sockAddr, ttl, null);
         }
         catch (Exception)
         {
