@@ -33,5 +33,6 @@ int main(string[] args)
         "tests.connection_drain_test",
         "tests.socket_pool_test",
         "tests.nat_test",
+        "tests.secure_payload_test",
     );
 }
