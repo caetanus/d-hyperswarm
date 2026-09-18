@@ -107,8 +107,9 @@ int main(string[] args)
     string[] bootstrap;
     int probeSize = 0; // diagnostic: also send an N-byte marker each punch tick
     bool keepAlive = false; // OFF by default: a concurrent DHT flow splits the punch port
+    string fireAt; // "HH:MM:SS" local: synchronized punch start (both sides fire together)
     auto help = getopt(args, "role", &role, "bootstrap", &bootstrap,
-        "probe-size", &probeSize, "keepalive", &keepAlive);
+        "probe-size", &probeSize, "keepalive", &keepAlive, "fire-at", &fireAt);
     if (help.helpWanted)
     {
         writeln("holepunch-probe --role initiator|responder [--bootstrap host:port]...");
@@ -295,6 +296,38 @@ int main(string[] args)
             };
 
             hp.updateRemote(true, FW_CONSISTENT, [Address(peer.host, 4, peer.port)], peer.host);
+
+            // Synchronized start: wait until the shared wall-clock instant so BOTH
+            // sides fire their first beacon together (within RTT). This establishes
+            // both outbound conntrack flows before either peer's inbound arrives, so
+            // nf_nat can't reallocate a fresh external port on the inbound race — the
+            // manual stand-in for hyperdht's relay-coordinated round sync.
+            if (fireAt.length)
+            {
+                import std.datetime.systime : Clock;
+                import std.datetime.date : TimeOfDay;
+
+                TimeOfDay tgt;
+                try
+                    tgt = TimeOfDay.fromISOExtString(fireAt);
+                catch (Exception)
+                {
+                    writeln("[", role, "] bad --fire-at '", fireAt, "' (want HH:MM:SS)");
+                    exitEventLoop();
+                    return;
+                }
+                writeln("[", role, "] holding until ", fireAt, " for a synchronized punch...");
+                while (true)
+                {
+                    immutable now = Clock.currTime;
+                    immutable nowTod = TimeOfDay(now.hour, now.minute, now.second);
+                    if (nowTod >= tgt)
+                        break;
+                    sleep(20.msecs);
+                }
+                writeln("[", role, "] FIRE.");
+            }
+
             hp.punch();
 
             // Optional diagnostic: alongside the 1-byte beacon, spray a larger marker
