@@ -96,6 +96,10 @@ int hs_udx_socket_send (void *req, void *s, const uv_buf_t bufs[], unsigned int 
   return udx::udx_socket_send((udx::udx_socket_send_t *) req, (udx::udx_socket_t *) s, bufs, bufs_len, addr,
                              (udx::udx_socket_send_cb) cb);
 }
+int hs_udx_socket_send_ttl (void *req, void *s, const uv_buf_t bufs[], unsigned int bufs_len, const struct sockaddr *addr, int ttl, void *cb) {
+  return udx::udx_socket_send_ttl((udx::udx_socket_send_t *) req, (udx::udx_socket_t *) s, bufs, bufs_len, addr, ttl,
+                                 (udx::udx_socket_send_cb) cb);
+}
 int hs_udx_socket_recv_start (void *s, void *recv_cb) {
   return udx::udx_socket_recv_start((udx::udx_socket_t *) s, (udx::udx_socket_recv_cb) recv_cb);
 }
@@ -106,6 +110,10 @@ int hs_udx_stream_init (void *u, void *stream, uint32_t local_id, void *close_cb
 }
 int hs_udx_stream_connect (void *stream, void *socket, uint32_t remote_id, const struct sockaddr *remote_addr) {
   return udx::udx_stream_connect((udx::udx_stream_t *) stream, (udx::udx_socket_t *) socket, remote_id, remote_addr);
+}
+int hs_udx_stream_change_remote (void *stream, void *socket, uint32_t remote_id, const struct sockaddr *remote_addr, void *remote_changed_cb) {
+  return udx::udx_stream_change_remote((udx::udx_stream_t *) stream, (udx::udx_socket_t *) socket, remote_id, remote_addr,
+                                      (udx::udx_stream_remote_changed_cb) remote_changed_cb);
 }
 int hs_udx_stream_firewall (void *stream, void *firewall_cb) {
   return udx::udx_stream_firewall((udx::udx_stream_t *) stream, (udx::udx_stream_firewall_cb) firewall_cb);

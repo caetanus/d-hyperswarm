@@ -19,6 +19,7 @@ int main(string[] args)
         "tests.uv_timer_test",
         "tests.uv_udp_test",
         "tests.udx_echo_test",
+        "tests.udx_ttl_test",
         "tests.noise_crypto_test",
         "tests.noise_hs_test",
         "tests.secretstream_test",

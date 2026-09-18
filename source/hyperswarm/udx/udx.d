@@ -34,11 +34,13 @@ int hs_udx_socket_close(void* s);
 // packets; send transmits one datagram.
 size_t hs_udx_sizeof_socket_send();
 int hs_udx_socket_send(void* req, void* s, const(uv_buf_t)* bufs, uint bufs_len, const(void)* addr, void* cb);
+int hs_udx_socket_send_ttl(void* req, void* s, const(uv_buf_t)* bufs, uint bufs_len, const(void)* addr, int ttl, void* cb);
 int hs_udx_socket_recv_start(void* s, void* recv_cb);
 
 // Streams.
 int hs_udx_stream_init(void* u, void* stream, uint local_id, void* close_cb, void* finalize_cb);
 int hs_udx_stream_connect(void* stream, void* socket, uint remote_id, const(void)* remote_addr);
+int hs_udx_stream_change_remote(void* stream, void* socket, uint remote_id, const(void)* remote_addr, void* remote_changed_cb);
 int hs_udx_stream_firewall(void* stream, void* firewall_cb);
 int hs_udx_stream_read_start(void* stream, void* read_cb);
 int hs_udx_stream_write_sizeof(int nwbufs);
@@ -50,6 +52,7 @@ alias UdxIdleCb = extern (C) void function(void* udx) nothrow;
 alias UdxSocketCloseCb = extern (C) void function(void* socket) nothrow;
 alias UdxStreamCloseCb = extern (C) void function(void* stream, int status) nothrow;
 alias UdxStreamFinalizeCb = extern (C) void function(void* stream) nothrow;
+alias UdxStreamRemoteChangedCb = extern (C) void function(void* stream) nothrow;
 alias UdxStreamReadCb = extern (C) void function(void* stream, ptrdiff_t read_len, const(uv_buf_t)* buf) nothrow;
 alias UdxStreamFirewallCb = extern (C) int function(void* stream, void* socket, const(void)* from) nothrow;
 alias UdxStreamAckCb = extern (C) void function(void* req, int status, int unordered) nothrow;
