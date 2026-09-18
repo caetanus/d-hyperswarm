@@ -81,6 +81,11 @@ private __gshared bool g_peerReady;
 // Touched only on the vibe loop thread (main fiber + keepalive fiber), so no lock.
 private __gshared bool g_keepAlive;
 
+// Set when we receive a beacon from the peer — proof the hole is open toward us.
+// The responder never "connects" at the holepuncher layer (it reflects), so an
+// inbound beacon is its success signal.
+private __gshared bool g_recvBeacon;
+
 private void readPeerLine() nothrow
 {
     try
@@ -189,7 +194,10 @@ int main(string[] args)
                             " rawFdPort=", rawFdPort(srcFd), " -> ", addr.host, ":", addr.port,
                             " ttl=", ttl);
                     else
+                    {
+                        g_recvBeacon = true; // hole is open toward us
                         writeln("[", role, "] RECV beacon <- ", addr.host, ":", addr.port);
+                    }
                 }
                 catch (Exception)
                 {
@@ -288,7 +296,17 @@ int main(string[] args)
             };
             hp.onAbort = () nothrow {
                 try
-                    writeln("[", role, "] ABORT: punch abandoned");
+                {
+                    // The responder never connects at the holepuncher layer; if it got
+                    // an inbound beacon the hole is open and that's success, not abort.
+                    if (!isInitiator && g_recvBeacon)
+                    {
+                        writeln("[", role, "] SUCCESS: hole open (received peer beacon)");
+                        result = 0;
+                    }
+                    else
+                        writeln("[", role, "] ABORT: punch abandoned");
+                }
                 catch (Exception)
                 {
                 }
@@ -361,17 +379,18 @@ int main(string[] args)
                 });
             }
 
-            // 4. Run up to ~45s. The responder never self-connects (it reflects), so a
-            //    clean reflecting run is its success; the initiator flips result on SUCCESS.
+            // 4. Run up to ~45s. The responder never self-connects (it reflects), so its
+            //    success is an inbound beacon (g_recvBeacon); the initiator flips result
+            //    on onConnect. onAbort also promotes a responder that received a beacon.
             foreach (_; 0 .. 450)
             {
-                if (done)
+                if (done || (!isInitiator && g_recvBeacon))
                     break;
                 sleep(100.msecs);
             }
-            if (!isInitiator && !done)
+            if (!isInitiator && g_recvBeacon && result != 0)
             {
-                writeln("[", role, "] reflected for the full round (initiator confirms the hole)");
+                writeln("[", role, "] SUCCESS: hole open (received peer beacon)");
                 result = 0;
             }
             hp.destroy();
