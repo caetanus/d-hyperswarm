@@ -32,5 +32,6 @@ int main(string[] args)
         "hyperswarm.connection",
         "tests.connection_drain_test",
         "tests.socket_pool_test",
+        "tests.nat_test",
     );
 }
