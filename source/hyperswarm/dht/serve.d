@@ -30,6 +30,8 @@ import std.random : uniform;
 // one may sit before we tear it down — bounds a flood of handshakes with no SYN.
 private enum size_t MAX_PENDING = 512;
 private enum HANDSHAKE_WAIT = 10;
+// The punch needs several seconds of rounds + probes before the client's SYN arrives.
+private enum HOLEPUNCH_WAIT = 45;
 
 // handshake relay modes (lib/router.js)
 private enum uint FROM_CLIENT = 0;
@@ -180,14 +182,34 @@ final class Server
         auto msg2 = wrap.send(p);
         auto result = wrap.finish();
 
+        // Accept stream (both paths): udx matches the client's SYN to it by stream id
+        // and fires the firewall cb, whether the SYN arrives on our main socket (OPEN)
+        // or the punched holder (holepunch) — udx processes stream packets on a pool
+        // socket internally, so the cb binds the stream to whichever socket it landed on.
+        auto stream = new ubyte[](hs_udx_sizeof_stream());
+        hs_udx_stream_init(dht.rpc.udxPtr, stream.ptr, serverUdxId, &hsConnClose, &hsConnFinalize);
+        hs_udx_stream_firewall(stream.ptr, &hsServerFirewall);
+        hs_udx_stream_read_start(stream.ptr, &hsConnRead);
+
+        auto ss = SecretStream.fromHandshake(false, result.tx, result.rx, result.hash,
+            result.remotePublicKey);
+        auto conn = new Connection(dht.rpc.udxPtr, stream.ptr, ss, result.remotePublicKey);
+        auto cb = onConnection;
+        conn.onOpen = () nothrow {
+            if (cb !is null)
+                cb(conn);
+        };
+        g_incoming[stream.ptr] = Incoming(clientPayload.udx.id, conn);
+
         if (wantHolepunch)
         {
+            // Register the half-open session; its PEER_HOLEPUNCH rounds open the hole,
+            // then the client's SYN arrives over the punched holder and the firewall cb
+            // above accepts it. Sample our own external in the background so the round
+            // can advertise it (hyperdht's autoSample).
             auto session = new HolepunchSession(dht.rpc, dht.pool, result.holepunchSecret,
                 /*isInitiator*/ false, clientPayload.firewall);
             holepunches[punchId] = session;
-            // Learn our own external mapping in the background (hyperdht's autoSample)
-            // so the round can advertise it. E3 will bind an accept stream onto the
-            // punched socket via session.puncher.onConnect.
             auto seeds = dht.bootstrap;
             runTask(() nothrow {
                 try
@@ -197,40 +219,33 @@ final class Server
                 }
             });
         }
-        else
-        {
-            // A udx stream that accepts the client's incoming SYN via the firewall cb.
-            auto stream = new ubyte[](hs_udx_sizeof_stream());
-            hs_udx_stream_init(dht.rpc.udxPtr, stream.ptr, serverUdxId, &hsConnClose, &hsConnFinalize);
-            hs_udx_stream_firewall(stream.ptr, &hsServerFirewall);
-            hs_udx_stream_read_start(stream.ptr, &hsConnRead);
 
-            auto ss = SecretStream.fromHandshake(false, result.tx, result.rx, result.hash,
-                result.remotePublicKey);
-            auto conn = new Connection(dht.rpc.udxPtr, stream.ptr, ss, result.remotePublicKey);
-            auto cb = onConnection;
-            conn.onOpen = () nothrow {
-                if (cb !is null)
-                    cb(conn);
-            };
-            g_incoming[stream.ptr] = Incoming(clientPayload.udx.id, conn);
-
-            // If the client never sends its SYN, tear the half-open stream down so a
-            // flood of handshakes can't pin streams + state forever.
-            auto sp = stream.ptr;
-            runTask(() nothrow {
-                try
-                    sleep(HANDSHAKE_WAIT.seconds);
-                catch (Exception)
+        // Tear the half-open accept (and any session) down if no SYN arrives — longer
+        // for the holepunch path (the punch takes several seconds of rounds + probes).
+        immutable waitSecs = wantHolepunch ? HOLEPUNCH_WAIT : HANDSHAKE_WAIT;
+        immutable cleanupPunch = wantHolepunch;
+        immutable cleanupId = punchId;
+        auto sp = stream.ptr;
+        runTask(() nothrow {
+            try
+                sleep(waitSecs.seconds);
+            catch (Exception)
+            {
+            }
+            if ((sp in g_incoming) !is null)
+            {
+                g_incoming.remove(sp);
+                conn.destroy();
+            }
+            if (cleanupPunch)
+            {
+                if (auto s = cleanupId in holepunches)
                 {
+                    (*s).destroy();
+                    holepunches.remove(cleanupId);
                 }
-                if ((sp in g_incoming) !is null)
-                {
-                    g_incoming.remove(sp);
-                    conn.destroy();
-                }
-            });
-        }
+            }
+        });
 
         // Send msg2 back the way the request came. A direct FROM_CLIENT connect gets
         // a plain REPLY. A relayed FROM_RELAY connect is relayed onward as a
