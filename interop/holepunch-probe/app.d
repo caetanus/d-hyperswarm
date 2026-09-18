@@ -223,24 +223,26 @@ int main(string[] args)
                 return;
             }
 
-            // Only when keepalive was on do we re-sample to check drift — the re-sample
-            // itself opens fresh holder->DHT flows, which is exactly the concurrency that
-            // splits the port, so we must NOT do it on the default single-flow path.
             if (keepAlive)
-            {
                 g_keepAlive = false;
-                auto nat2 = sampleNatOn(rpc, hp.socket(), seeds, true, 4, 2.seconds);
-                if (nat2.addresses.length &&
-                    (nat2.addresses[0].host != mine.host || nat2.addresses[0].port != mine.port))
-                    writeln("[", role, "] WARNING: mapping DRIFTED ", mine.host, ":", mine.port, " -> ",
-                        nat2.addresses[0].host, ":", nat2.addresses[0].port,
-                        " during exchange — the peer is aiming at the OLD port, punch will miss!");
-                else
-                    writeln("[", role, "] mapping held at ", mine.host, ":", mine.port, " (no drift)");
-            }
+
+            // Re-observe the holder's external RIGHT BEFORE punching. The rig's
+            // plain-UDP control proves concurrent DHT flows do NOT fork the port, so
+            // this re-sample is safe and it's the decisive diagnostic. Compare the
+            // three ports (this PUNCH-TIME, the advertised MY MAPPING, and the pcap
+            // beacon egress):
+            //   PUNCH-TIME == beacon-egress != MY MAPPING  => holder's external moved
+            //     after we advertised (advertise happened too early; peer aims stale).
+            //   PUNCH-TIME == MY MAPPING != beacon-egress   => the beacon leaves a
+            //     different socket than the sample (a D send-path bug).
+            auto nat2 = sampleNatOn(rpc, hp.socket(), seeds, true, 4, 2.seconds);
+            if (nat2.addresses.length)
+                writeln("[", role, "] PUNCH-TIME MAPPING: ", nat2.addresses[0].host, ":",
+                    nat2.addresses[0].port, "  (advertised MY MAPPING was ", mine.host, ":",
+                    mine.port, nat2.addresses[0].port == mine.port ? " — SAME)" : " — MOVED!)");
 
             writeln("[", role, "] punching toward ", peer.host, ":", peer.port,
-                " (single-flow, keepalive=", keepAlive, ") ...");
+                " (keepalive=", keepAlive, ") ...");
 
             // 3. Punch. The exchange was manual+controlled, so the peer addr is trusted.
             bool done;
