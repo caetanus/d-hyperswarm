@@ -165,3 +165,56 @@ final class Nat
         samples ~= Sample(host, port, 1);
     }
 }
+
+import core.time : Duration, seconds;
+
+import hyperswarm.dht.rpc : Rpc;
+import hyperswarm.dht.socket_pool : SocketPool;
+import hyperswarm.dht.wire : FIND_NODE;
+
+/// Classify a fresh pool socket's NAT by PINGing DHT nodes FROM it (so the
+/// replies' `to` field is that socket's own external mapping). Walks outward:
+/// `seeds` (bootstrap nodes) start it, each reply's closerNodes extend it, until
+/// the sampler has enough (minSamples) or the reachable nodes run out. The socket
+/// is released on the way out; the returned Nat holds the verdict + addresses.
+Nat sampleNat(Rpc rpc, SocketPool pool, Address[] seeds, bool firewalled,
+    size_t maxPings = Nat.minSamples, Duration timeout = 2.seconds)
+{
+    import std.random : uniform;
+
+    auto nat = new Nat(firewalled);
+    auto sock = pool.acquire();
+    scope (exit)
+        pool.release(sock);
+
+    // FIND_NODE toward a fixed random target: its reply carries our observed `to`
+    // (the NAT sample, independent of the command) AND closerNodes to walk, so the
+    // sample self-bootstraps instead of assuming a populated routing table.
+    ubyte[32] target;
+    foreach (ref b; target)
+        b = cast(ubyte) uniform(0, 256);
+
+    Address[] queue = seeds.dup;
+    bool[string] pinged;
+    size_t sent;
+    while (queue.length > 0 && sent < maxPings && !nat.analyzed)
+    {
+        immutable node = queue[0];
+        queue = queue[1 .. $];
+        immutable key = format("%s:%d", node.host, node.port);
+        if (key in pinged)
+            continue;
+        pinged[key] = true;
+        try
+        {
+            auto reply = rpc.request(node, FIND_NODE, target[], null, null, true, timeout, sock);
+            nat.add(reply.to, node); // reply.to = our external as this node saw us
+            sent++;
+            queue ~= reply.closerNodes;
+        }
+        catch (Exception)
+        {
+        } // unreachable node — try the next
+    }
+    return nat;
+}

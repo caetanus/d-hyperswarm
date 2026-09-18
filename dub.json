@@ -1,6 +1,6 @@
 {
 	"name": "hyperswarm",
-	"description": "Holepunch hyperswarm in D — wire-compatible with the real network, fibers on vibe-core, crypto on libsodium",
+	"description": "Holepunch hyperswarm in D \u2014 wire-compatible with the real network, fibers on vibe-core, crypto on libsodium",
 	"authors": [
 		"caetano"
 	],
@@ -51,64 +51,126 @@
 			"targetType": "executable",
 			"targetName": "dht-connect-peer",
 			"mainSourceFile": "interop/dht-connect/app.d",
-			"sourcePaths": ["source", "interop/dht-connect"],
-			"importPaths": ["source", "interop/dht-connect"]
+			"sourcePaths": [
+				"source",
+				"interop/dht-connect"
+			],
+			"importPaths": [
+				"source",
+				"interop/dht-connect"
+			]
 		},
 		{
 			"name": "hyperswarm-peer",
 			"targetType": "executable",
 			"targetName": "hyperswarm-peer",
 			"mainSourceFile": "interop/hyperswarm-dpeer/app.d",
-			"sourcePaths": ["source", "interop/hyperswarm-dpeer"],
-			"importPaths": ["source", "interop/hyperswarm-dpeer"]
+			"sourcePaths": [
+				"source",
+				"interop/hyperswarm-dpeer"
+			],
+			"importPaths": [
+				"source",
+				"interop/hyperswarm-dpeer"
+			]
 		},
 		{
 			"name": "hyperswarm-dserver",
 			"targetType": "executable",
 			"targetName": "hyperswarm-dserver",
 			"mainSourceFile": "interop/hyperswarm-dserver/app.d",
-			"sourcePaths": ["source", "interop/hyperswarm-dserver"],
-			"importPaths": ["source", "interop/hyperswarm-dserver"]
+			"sourcePaths": [
+				"source",
+				"interop/hyperswarm-dserver"
+			],
+			"importPaths": [
+				"source",
+				"interop/hyperswarm-dserver"
+			]
 		},
 		{
 			"name": "hyperswarm-d2d",
 			"targetType": "executable",
 			"targetName": "hyperswarm-d2d",
 			"mainSourceFile": "interop/hyperswarm-d2d/app.d",
-			"sourcePaths": ["source", "interop/hyperswarm-d2d"],
-			"importPaths": ["source", "interop/hyperswarm-d2d"]
+			"sourcePaths": [
+				"source",
+				"interop/hyperswarm-d2d"
+			],
+			"importPaths": [
+				"source",
+				"interop/hyperswarm-d2d"
+			]
+		},
+		{
+			"name": "photo-sync",
+			"targetType": "executable",
+			"targetName": "photo-sync",
+			"mainSourceFile": "examples/photo-sync/app.d",
+			"sourcePaths": [
+				"source",
+				"examples/photo-sync"
+			],
+			"importPaths": [
+				"source",
+				"examples/photo-sync"
+			]
 		},
 		{
 			"name": "dht-server-peer",
 			"targetType": "executable",
 			"targetName": "dht-server-peer",
 			"mainSourceFile": "interop/dht-server/app.d",
-			"sourcePaths": ["source", "interop/dht-server"],
-			"importPaths": ["source", "interop/dht-server"]
+			"sourcePaths": [
+				"source",
+				"interop/dht-server"
+			],
+			"importPaths": [
+				"source",
+				"interop/dht-server"
+			]
 		},
 		{
 			"name": "dht-serve-peer",
 			"targetType": "executable",
 			"targetName": "dht-serve-peer",
 			"mainSourceFile": "interop/dht-serve/app.d",
-			"sourcePaths": ["source", "interop/dht-serve"],
-			"importPaths": ["source", "interop/dht-serve"]
+			"sourcePaths": [
+				"source",
+				"interop/dht-serve"
+			],
+			"importPaths": [
+				"source",
+				"interop/dht-serve"
+			]
 		},
 		{
 			"name": "dht-announce-peer",
 			"targetType": "executable",
 			"targetName": "dht-announce-peer",
 			"mainSourceFile": "interop/dht-announce/app.d",
-			"sourcePaths": ["source", "interop/dht-announce"],
-			"importPaths": ["source", "interop/dht-announce"]
+			"sourcePaths": [
+				"source",
+				"interop/dht-announce"
+			],
+			"importPaths": [
+				"source",
+				"interop/dht-announce"
+			]
 		},
 		{
 			"name": "dht-lookup-peer",
 			"targetType": "executable",
 			"targetName": "dht-lookup-peer",
 			"mainSourceFile": "interop/dht-lookup/app.d",
-			"sourcePaths": ["source", "interop/dht-lookup"],
-			"importPaths": ["source", "interop/dht-lookup"]
+			"sourcePaths": [
+				"source",
+				"interop/dht-lookup"
+			],
+			"importPaths": [
+				"source",
+				"interop/dht-lookup"
+			]
 		},
 		{
 			"name": "dht-interop-peer",
@@ -157,6 +219,20 @@
 			},
 			"dflags": [
 				"-unittest"
+			]
+		},
+		{
+			"name": "nat-sample",
+			"targetType": "executable",
+			"targetName": "nat-sample",
+			"mainSourceFile": "interop/nat-sample/app.d",
+			"sourcePaths": [
+				"source",
+				"interop/nat-sample"
+			],
+			"importPaths": [
+				"source",
+				"interop/udx-dpeer"
 			]
 		}
 	]
