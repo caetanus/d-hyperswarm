@@ -11,9 +11,11 @@ module hyperswarm.dht.serve;
 
 import hyperswarm.dht.node : Dht;
 import hyperswarm.dht.noise_wrap : NoiseWrap, HandshakeResult;
-import hyperswarm.dht.connect_messages : Handshake, NoisePayload, UdxInfo, FW_OPEN,
-    encodeHandshake, decodeHandshake;
-import hyperswarm.dht.messages : HS_PEER_HANDSHAKE;
+import hyperswarm.dht.connect_messages : Handshake, NoisePayload, UdxInfo, HolepunchInfo,
+    Holepunch, FW_OPEN, FW_UNKNOWN, encodeHandshake, decodeHandshake, encodeHolepunch,
+    decodeHolepunch;
+import hyperswarm.dht.holepunch_session : HolepunchSession;
+import hyperswarm.dht.messages : HS_PEER_HANDSHAKE, HS_PEER_HOLEPUNCH;
 import hyperswarm.dht.wire : RequestPacket, encodeReply, encodeRequest;
 import hyperswarm.connection : Connection, hsConnRead, hsConnClose, hsConnFinalize;
 import hyperswarm.udx.udx;
@@ -69,6 +71,11 @@ final class Server
     private Keypair keyPair;
     void delegate(Connection) nothrow onConnection;
 
+    // Half-open holepunch sessions, keyed by the id we advertise in the noise payload
+    // (hyperdht's _holepunches). A firewalled client's PEER_HOLEPUNCH rounds route here.
+    private HolepunchSession[uint] holepunches;
+    private uint nextPunchId = 1;
+
     this(Dht dht, Keypair keyPair)
     {
         this.dht = dht;
@@ -96,13 +103,42 @@ final class Server
 
     private void onRequest(RequestPacket req, Address from) nothrow
     {
-        if (req.command != HS_PEER_HANDSHAKE || req.value.length == 0)
+        if (req.value.length == 0)
             return;
         try
-            handlePeerHandshake(req, from);
+        {
+            if (req.command == HS_PEER_HANDSHAKE)
+                handlePeerHandshake(req, from);
+            else if (req.command == HS_PEER_HOLEPUNCH)
+                onpeerholepunch(req, from);
+        }
         catch (Exception)
         {
         }
+    }
+
+    // A relayed PEER_HOLEPUNCH round for one of our half-open sessions: run the
+    // round-step and relay the sealed reply back the way it came (server.js
+    // _onpeerholepunch). The request arrives on our MAIN rpc socket (the relay sends
+    // it there), not the puncher's holder, so viaOurSocket is false — our NAT comes
+    // from the session's own DHT sampling, not this request. Relay-tracking (to set
+    // isServerRelay for token echo) is deferred; false is conservative.
+    private void onpeerholepunch(RequestPacket req, Address from)
+    {
+        auto env = decodeHolepunch(req.value);
+        auto sp = env.id in holepunches;
+        if (sp is null)
+            return;
+        auto reply = (*sp).handleRound(env, req.to, from, /*viaOurSocket*/ false,
+            /*isServerRelay*/ false);
+        if (reply.isNull)
+            return;
+        Holepunch back;
+        back.id = env.id;
+        back.hasPeerAddress = env.hasPeerAddress;
+        back.peerAddress = env.peerAddress;
+        back.payload = reply.get;
+        dht.rpc.send(from, encodeReply(req.tid, from, null, null, null, 0, encodeHolepunch(back)));
     }
 
     private void handlePeerHandshake(RequestPacket req, Address from)
@@ -118,46 +154,83 @@ final class Server
         auto clientPayload = wrap.recv(env.noise);
 
         immutable uint serverUdxId = cast(uint) uniform(1, uint.max);
+        immutable wantHolepunch = clientPayload.firewall != FW_OPEN;
+
         NoisePayload p;
-        p.firewall = FW_OPEN;
         p.addresses4 = [ourUdxAddr];
         p.hasUdx = true;
         p.udx = UdxInfo(1, false, serverUdxId, 0);
         p.hasSecretStream = true;
+
+        uint punchId;
+        if (wantHolepunch)
+        {
+            // Client is firewalled: advertise firewall=UNKNOWN + holepunch{id} and
+            // register a half-open session for its PEER_HOLEPUNCH rounds. relays left
+            // empty — the D client reuses the handshake relay, so its "holepunchable"
+            // test is hasHolepunch, not relays.length (noted in stage-e-plan.md).
+            punchId = nextPunchId++;
+            p.firewall = FW_UNKNOWN;
+            p.hasHolepunch = true;
+            p.holepunch = HolepunchInfo(punchId, []);
+        }
+        else
+            p.firewall = FW_OPEN;
+
         auto msg2 = wrap.send(p);
         auto result = wrap.finish();
 
-        // A udx stream that accepts the client's incoming SYN via the firewall cb.
-        auto stream = new ubyte[](hs_udx_sizeof_stream());
-        hs_udx_stream_init(dht.rpc.udxPtr, stream.ptr, serverUdxId, &hsConnClose, &hsConnFinalize);
-        hs_udx_stream_firewall(stream.ptr, &hsServerFirewall);
-        hs_udx_stream_read_start(stream.ptr, &hsConnRead);
+        if (wantHolepunch)
+        {
+            auto session = new HolepunchSession(dht.rpc, dht.pool, result.holepunchSecret,
+                /*isInitiator*/ false, clientPayload.firewall);
+            holepunches[punchId] = session;
+            // Learn our own external mapping in the background (hyperdht's autoSample)
+            // so the round can advertise it. E3 will bind an accept stream onto the
+            // punched socket via session.puncher.onConnect.
+            auto seeds = dht.bootstrap;
+            runTask(() nothrow {
+                try
+                    session.sample(seeds);
+                catch (Exception)
+                {
+                }
+            });
+        }
+        else
+        {
+            // A udx stream that accepts the client's incoming SYN via the firewall cb.
+            auto stream = new ubyte[](hs_udx_sizeof_stream());
+            hs_udx_stream_init(dht.rpc.udxPtr, stream.ptr, serverUdxId, &hsConnClose, &hsConnFinalize);
+            hs_udx_stream_firewall(stream.ptr, &hsServerFirewall);
+            hs_udx_stream_read_start(stream.ptr, &hsConnRead);
 
-        auto ss = SecretStream.fromHandshake(false, result.tx, result.rx, result.hash,
-            result.remotePublicKey);
-        auto conn = new Connection(dht.rpc.udxPtr, stream.ptr, ss, result.remotePublicKey);
-        auto cb = onConnection;
-        conn.onOpen = () nothrow {
-            if (cb !is null)
-                cb(conn);
-        };
-        g_incoming[stream.ptr] = Incoming(clientPayload.udx.id, conn);
+            auto ss = SecretStream.fromHandshake(false, result.tx, result.rx, result.hash,
+                result.remotePublicKey);
+            auto conn = new Connection(dht.rpc.udxPtr, stream.ptr, ss, result.remotePublicKey);
+            auto cb = onConnection;
+            conn.onOpen = () nothrow {
+                if (cb !is null)
+                    cb(conn);
+            };
+            g_incoming[stream.ptr] = Incoming(clientPayload.udx.id, conn);
 
-        // If the client never sends its SYN, tear the half-open stream down so a
-        // flood of handshakes can't pin streams + state forever.
-        auto sp = stream.ptr;
-        runTask(() nothrow {
-            try
-                sleep(HANDSHAKE_WAIT.seconds);
-            catch (Exception)
-            {
-            }
-            if ((sp in g_incoming) !is null)
-            {
-                g_incoming.remove(sp);
-                conn.destroy();
-            }
-        });
+            // If the client never sends its SYN, tear the half-open stream down so a
+            // flood of handshakes can't pin streams + state forever.
+            auto sp = stream.ptr;
+            runTask(() nothrow {
+                try
+                    sleep(HANDSHAKE_WAIT.seconds);
+                catch (Exception)
+                {
+                }
+                if ((sp in g_incoming) !is null)
+                {
+                    g_incoming.remove(sp);
+                    conn.destroy();
+                }
+            });
+        }
 
         // Send msg2 back the way the request came. A direct FROM_CLIENT connect gets
         // a plain REPLY. A relayed FROM_RELAY connect is relayed onward as a
