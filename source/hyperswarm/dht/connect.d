@@ -14,8 +14,15 @@ import hyperswarm.dht.connect_messages : Handshake, NoisePayload, UdxInfo, Holep
 import hyperswarm.dht.holepunch_session : HolepunchSession;
 import hyperswarm.dht.messages : HS_FIND_PEER, HS_PEER_HANDSHAKE, HS_PEER_HOLEPUNCH;
 import hyperswarm.noise.crypto : keyedBlake2b, Keypair;
+import hyperswarm.noise.stream : SecretStream;
+import hyperswarm.connection : Connection, hsConnRead, hsConnClose, hsConnFinalize;
+import hyperswarm.udx.udx;
 import hyperswarm.cenc : Address;
 import core.time : Duration, seconds;
+import core.sys.posix.sys.socket : sockaddr, AF_INET;
+import core.sys.posix.netinet.in_ : sockaddr_in;
+import core.sys.posix.arpa.inet : htons, inet_pton;
+import std.string : toStringz;
 
 // handshake relay modes (lib/router.js)
 enum uint FROM_CLIENT = 0;
@@ -187,4 +194,30 @@ void connectHolepunch(Dht dht, HolepunchSession session, ConnectHandshake ch,
     // both sides, so neither is the nf_nat second-mover).
     sendRound(true);
     p.punch();
+}
+
+/// E3 (client side): the hole is open — form the connection over the punched socket.
+/// Mirrors the OPEN client path (interop/dht-connect) but on `punchedSocket` to the
+/// punched `peer` address (from puncher.onConnect) instead of the advertised server
+/// address. Opens a UDX stream to the server's udx id, runs the initiator secret-
+/// stream from the handshake keys, and returns the Connection (its onOpen fires once
+/// the secret-stream handshake completes over the hole).
+Connection formPunchedConnection(Dht dht, void* punchedSocket, Address peer, ConnectHandshake ch)
+{
+    auto stream = new ubyte[](hs_udx_sizeof_stream());
+    hs_udx_stream_init(dht.rpc.udxPtr, stream.ptr, ch.ourUdxId, &hsConnClose, &hsConnFinalize);
+    hs_udx_stream_read_start(stream.ptr, &hsConnRead);
+
+    auto ss = SecretStream.fromHandshake(true, ch.hs.tx, ch.hs.rx, ch.hs.hash,
+        ch.hs.remotePublicKey);
+    auto conn = new Connection(dht.rpc.udxPtr, stream.ptr, ss, ch.hs.remotePublicKey);
+
+    sockaddr_in sa;
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(peer.port);
+    inet_pton(AF_INET, peer.host.toStringz, &sa.sin_addr);
+    hs_udx_stream_connect(stream.ptr, punchedSocket, ch.serverPayload.udx.id, cast(sockaddr*)&sa);
+
+    conn.start(); // our secret-stream setup frame, over the punched hole
+    return conn;
 }
