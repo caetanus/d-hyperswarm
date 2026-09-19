@@ -211,15 +211,21 @@ final class Loop
     private bool nextDeadline(out ulong next) nothrow
     {
         bool any;
-        foreach (ref t; timers)
+        try
         {
-            if (!t.active)
-                continue;
-            if (!any || t.deadline < next)
+            foreach (ref t; timers)
             {
-                next = t.deadline;
-                any = true;
+                if (!t.active)
+                    continue;
+                if (!any || t.deadline < next)
+                {
+                    next = t.deadline;
+                    any = true;
+                }
             }
+        }
+        catch (Exception)
+        {
         }
         return any;
     }

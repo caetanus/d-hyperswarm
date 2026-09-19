@@ -248,6 +248,20 @@
 				"source",
 				"interop/holepunch-probe"
 			]
+		},
+		{
+			"name": "vpn-rendezvous",
+			"targetType": "executable",
+			"targetName": "vpn-rendezvous",
+			"mainSourceFile": "interop/vpn-rendezvous/app.d",
+			"sourcePaths": [
+				"source",
+				"interop/vpn-rendezvous"
+			],
+			"importPaths": [
+				"source",
+				"interop/vpn-rendezvous"
+			]
 		}
 	]
 }
