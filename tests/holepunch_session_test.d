@@ -74,7 +74,7 @@ unittest
                 g_rtReplyOk = true;
                 // 3. Client applies the server's reply.
                 g_rtApplyOk = client.applyReply(reply.get, Address("5.5.5.5", 4, 5555),
-                    Address("6.6.6.6", 4, 6666));
+                    Address("6.6.6.6", 4, 6666)).ok;
                 g_rtClientRemoteFw = client.puncher.remoteFirewall;
                 g_rtClientRemoteAddrs = client.puncher.remoteAddresses.length;
             }
@@ -84,6 +84,8 @@ unittest
         }
         try
         {
+            if (pool !is null)
+                pool.closeAll(); // the sessions' punch sockets, before the dht socket
             if (rpc !is null)
                 rpc.close();
         }
@@ -175,6 +177,8 @@ unittest
         }
         try
         {
+            if (pool !is null)
+                pool.closeAll(); // the sessions' punch sockets, before the dht socket
             if (rpc !is null)
                 rpc.close();
         }
@@ -196,4 +200,87 @@ unittest
     g_remotePunching.should.equal(true);
     g_remoteAddrCount.should.equal(cast(size_t) 1);
     g_tokenEchoed.should.equal(false); // not a server relay -> no token echo
+}
+
+
+// server.js: a round that asks us to RANDOM-punch while the DHT-wide gate is busy
+// (another random punch running, or one ended <20 s ago) is answered TRY_LATER —
+// and, with no relay-through to retry over, as an abort that ends the session.
+private __gshared bool g_tlReply, g_tlDecrypts, g_tlDestroyed;
+private __gshared uint g_tlError;
+
+@("holepunch session: random punch while the gate is busy -> TRY_LATER abort")
+unittest
+{
+    import hyperswarm.dht.holepuncher : RandomPunchGate;
+    import hyperswarm.dht.connect_messages : FW_RANDOM, ERR_TRY_LATER;
+
+    g_tlReply = g_tlDecrypts = g_tlDestroyed = false;
+    g_tlError = 999;
+
+    runTask(() nothrow {
+        Rpc rpc;
+        SocketPool pool;
+        try
+        {
+            rpc = new Rpc(0);
+            pool = new SocketPool(rpc);
+            auto gate = new RandomPunchGate();
+            gate.punches = 1; // limit is 1: busy
+
+            ubyte[32] secret = 9;
+            auto server = new HolepunchSession(rpc, pool, secret, /*isInitiator*/ false, FW_UNKNOWN, gate);
+            auto clientSeal = new SecurePayload(secret);
+
+            HolepunchPayload cp;
+            cp.firewall = FW_RANDOM; // the client is behind a symmetric NAT: a random punch
+            cp.round = 0;
+            cp.punching = true;
+            cp.addresses = [Address("1.2.3.4", 4, 0)];
+
+            Holepunch env;
+            env.id = 0;
+            env.hasPeerAddress = true;
+            env.peerAddress = Address("9.9.9.9", 4, 4242);
+            env.payload = clientSeal.encrypt(cp);
+
+            auto reply = server.handleRound(env, Address("2.2.2.2", 4, 1111),
+                Address("3.3.3.3", 4, 2222), /*viaOurSocket*/ false, /*isServerRelay*/ false);
+            g_tlDestroyed = server.destroyed;
+            if (!reply.isNull)
+            {
+                g_tlReply = true;
+                auto opened = clientSeal.decrypt(reply.get);
+                if (!opened.isNull)
+                {
+                    g_tlDecrypts = true;
+                    g_tlError = opened.get.error;
+                }
+            }
+        }
+        catch (Exception)
+        {
+        }
+        try
+        {
+            if (pool !is null)
+                pool.closeAll(); // the sessions' punch sockets, before the dht socket
+            if (rpc !is null)
+                rpc.close();
+        }
+        catch (Exception)
+        {
+        }
+        try
+            exitEventLoop();
+        catch (Exception)
+        {
+        }
+    });
+    runEventLoop();
+
+    g_tlReply.should.equal(true);
+    g_tlDecrypts.should.equal(true);
+    g_tlError.should.equal(ERR_TRY_LATER);
+    g_tlDestroyed.should.equal(true); // an abort: the session is over
 }

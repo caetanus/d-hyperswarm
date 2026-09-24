@@ -1,5 +1,5 @@
 /// First behaviour of the libuv→vibe facade: a timer registered through the
-/// `hsuv_*` API fires on the vibe event loop, driven by `Loop.run`. This is the
+/// `__d_hsuv_*` API fires on the vibe event loop, driven by `Loop.run`. This is the
 /// run model libudx's RTO/keepalive/pacing timers will ride on.
 ///
 /// Assertions run AFTER runEventLoop returns — never inside a fiber body (calling
@@ -28,7 +28,7 @@ extern (C) void onRepeat(uv_handle_t* h) nothrow
     if (g_repeatFires >= 3)
     {
         try
-            hsuv_timer_stop(h);
+            __d_hsuv_timer_stop(h);
         catch (Exception)
         {
         }
@@ -45,14 +45,15 @@ unittest
         {
             auto loop = new Loop();
             auto t = new uv_timer_t;
-            hsuv_timer_init(loop.chandle, t);
+            __d_hsuv_timer_init(loop.chandle, t);
             g_started = MonoTime.currTime;
-            hsuv_timer_start(t, &onOneShot, 40, 0);
+            __d_hsuv_timer_start(t, &onOneShot, 40, 0);
 
-            runTask(() nothrow { try loop.run(); catch (Exception) {} });
+            auto loopTask = runTask(() nothrow { try loop.run(); catch (Exception) {} });
 
             sleep(160.msecs);
             loop.stop();
+            loopTask.join(); // let the runner return, so no task outlives the test
         }
         catch (Exception)
         {
@@ -80,13 +81,14 @@ unittest
         {
             auto loop = new Loop();
             auto t = new uv_timer_t;
-            hsuv_timer_init(loop.chandle, t);
-            hsuv_timer_start(t, &onRepeat, 20, 20); // repeat every 20ms
+            __d_hsuv_timer_init(loop.chandle, t);
+            __d_hsuv_timer_start(t, &onRepeat, 20, 20); // repeat every 20ms
 
-            runTask(() nothrow { try loop.run(); catch (Exception) {} });
+            auto loopTask = runTask(() nothrow { try loop.run(); catch (Exception) {} });
 
             sleep(200.msecs);
             loop.stop();
+            loopTask.join(); // let the runner return, so no task outlives the test
         }
         catch (Exception)
         {

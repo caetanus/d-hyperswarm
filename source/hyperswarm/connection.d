@@ -15,11 +15,20 @@ import core.time : Duration, MonoTime, msecs, seconds;
 import vibe.core.core : sleep;
 
 import hyperswarm.udx.udx;
-import hyperswarm.udx.facade : uv_buf_t;
+import hyperswarm.cenc : Address;
+import hyperswarm.udx.facade : uv_buf_t, udxCallbackEnter, udxCallbackLeave;
 import hyperswarm.noise.stream : SecretStream;
+import hyperswarm.dht.socket_pool : SocketPool;
 
 private __gshared Connection[void*] g_conns; // stream ptr -> Connection
 private __gshared Connection[void*] g_writeOwner; // write-req ptr -> Connection
+// stream ptr -> Connection, from udx's on_close until its on_finalize. udx calls on_close
+// BEFORE it cancels the queued writes (clear_outgoing_packets derefs each write request
+// and fires its ack with UV_ECANCELED), and keeps using the stream block itself until
+// finalize. Both the request/payload roots in `pending` and the GC-allocated stream block
+// (held by the Connection) must outlive that — the app's onClose can allocate, and a
+// collection in between would free memory libudx is about to touch.
+private __gshared Connection[void*] g_closing;
 
 /// The udx read callback: route decrypted-stream input to the owning Connection.
 extern (C) void hsConnRead(void* stream, ptrdiff_t len, const(uv_buf_t)* buf) nothrow
@@ -47,16 +56,48 @@ extern (C) void hsConnClose(void* stream, int status) nothrow
         auto conn = *c;
         conn.closed = true;
         g_conns.remove(stream);
-        // release any still-inflight write buffers for this connection
-        foreach (req; conn.pending.keys)
-            g_writeOwner.remove(req);
-        conn.pending = null;
+        // Keep the in-flight write roots: udx cancels them right after this callback
+        // returns, acking each (hsConnAck drops it); hsConnFinalize releases any rest.
+        g_closing[stream] = conn;
+        // The callbacks below reach application code, on whatever task udx closes the
+        // stream from; mark it so a shutdown started there defers (Rpc.close).
+        udxCallbackEnter();
+        scope (exit)
+            udxCallbackLeave();
+        // The swarm's registry cleanup runs FIRST and independently of the app's
+        // onClose: onClose is a single delegate the application owns (and overwrites),
+        // so the connection-registry eviction must not live there or a same-key peer
+        // could never reconnect until the swarm was recreated.
+        if (conn.onCloseInternal !is null)
+            conn.onCloseInternal();
         if (conn.onClose !is null)
             conn.onClose();
+        // A connection over a punched hole owns the pool socket it rides; udx has
+        // unlinked the stream from it by now, so the socket can finally close.
+        if (conn.ownerPool !is null)
+        {
+            auto pool = conn.ownerPool;
+            auto s = conn.ownedSocket;
+            conn.ownerPool = null;
+            conn.ownedSocket = null;
+            pool.giveBack(s);
+        }
     }
 }
 
-extern (C) void hsConnFinalize(void* stream) nothrow {}
+/// udx is done with the stream block (its timers are closed): release what the close
+/// kept alive for it.
+extern (C) void hsConnFinalize(void* stream) nothrow
+{
+    if (auto c = stream in g_closing)
+    {
+        auto conn = *c;
+        foreach (req; conn.pending.keys)
+            g_writeOwner.remove(req);
+        conn.pending = null;
+        g_closing.remove(stream);
+    }
+}
 
 final class Connection
 {
@@ -64,6 +105,13 @@ final class Connection
     private void* stream; // opaque udx_stream block pointer
     private SecretStream ss;
     ubyte[32] remotePublicKey;
+    // The punched pool socket this connection's stream rides (null on the shared
+    // dht socket). Lent by the pool; returned from the close callback.
+    package SocketPool ownerPool;
+    package void* ownedSocket;
+    /// Where the peer is, for THIS connection (a peer can be reached at several —
+    /// its LAN address and its punched WAN one — each its own connection).
+    Address remoteAddress;
     // In-flight writes: request-block ptr -> [request block, payload], kept alive
     // until udx acks (hsConnAck), so a long-lived connection doesn't accumulate
     // every byte it ever sent.
@@ -82,6 +130,10 @@ final class Connection
     private bool openFired;
     /// Delegate invoked when the underlying UDX stream closes.
     void delegate() nothrow onClose;
+    /// Swarm-internal close hook, fired before onClose and NOT exposed for the app
+    /// to overwrite — the Hyperswarm connection registry evicts the peer here so a
+    /// reconnect with the same public key is accepted after a drop.
+    package void delegate() nothrow onCloseInternal;
 
     /// Decrypted application messages. Setting a handler drains anything that
     /// arrived before it was set, so a peer that writes first is never lost.
@@ -133,6 +185,16 @@ final class Connection
         this.ss = ss;
         this.remotePublicKey = remotePublicKey;
         g_conns[stream] = this;
+    }
+
+    /// Take ownership of the punched pool socket `sock` (the hole this stream is
+    /// connected over): the pool lends it, and it is closed when this connection's
+    /// stream is gone. The stream must already be connected on it.
+    package void ownSocket(SocketPool pool, void* sock) nothrow
+    {
+        ownerPool = pool;
+        ownedSocket = sock;
+        pool.lend(sock);
     }
 
     /// Writes handed to udx but not yet acknowledged by the far end. Reaches zero

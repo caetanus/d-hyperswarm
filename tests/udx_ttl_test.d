@@ -39,7 +39,7 @@ unittest
         try
         {
             auto loop = new Loop();
-            runTask(() nothrow { try loop.run(); catch (Exception) {} });
+            auto loopTask = runTask(() nothrow { try loop.run(); catch (Exception) {} });
 
             auto udx = new ubyte[hs_udx_sizeof_udx()];
             hs_udx_init(loop.chandle, udx.ptr, null);
@@ -68,7 +68,12 @@ unittest
             for (int i = 0; i < 200 && g_rxLen < 0; i++)
                 sleep(10.msecs);
 
+            // Close the sockets before stopping the loop, so none outlives the test.
+            hs_udx_socket_close(sockA.ptr);
+            hs_udx_socket_close(sockB.ptr);
+            sleep(50.msecs);
             loop.stop();
+            loopTask.join(); // let the runner return, so no task outlives the test
         }
         catch (Exception)
         {

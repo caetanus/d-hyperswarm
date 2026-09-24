@@ -1,7 +1,7 @@
-/// The D side of the libuv→vibe facade: the `hsuv_*` functions libudx calls.
+/// The D side of the libuv→vibe facade: the `__d_hsuv_*` functions libudx calls.
 ///
 /// libudx's vendored C is amalgamated as one C++ TU in `namespace udx` and
-/// compiled against our shim uv.h, which renames every libuv function to `hsuv_*`
+/// compiled against our shim uv.h, which renames every libuv function to `__d_hsuv_*`
 /// (symbol isolation — see vendor/libudx-shim/uv.h). Those are the C-ABI symbols
 /// this module defines. libudx never calls uv_run: WE drive the callbacks from a
 /// vibe fiber (`Loop.run`), so there is one event loop (vibe's), single-threaded.
@@ -15,7 +15,7 @@
 /// STATUS: loop + timers + buffers + UDP are live; prepare/check, getaddrinfo and
 /// interfaces are still stubs (they assert if called). See notes/uv-facade.md.
 ///
-/// Every `hsuv_*` function is `nothrow`: libudx is C and a D exception unwinding
+/// Every `__d_hsuv_*` function is `nothrow`: libudx is C and a D exception unwinding
 /// into it would be undefined behaviour, so each catches internally and returns a
 /// libuv-style negative code on failure.
 module hyperswarm.udx.facade;
@@ -28,6 +28,7 @@ import core.sys.posix.netinet.in_ : sockaddr_in, sockaddr_in6, IPPROTO_IP;
 import vibe.core.sync : LocalManualEvent, createManualEvent;
 import vibe.core.net : UDPConnection, NetworkAddress, listenUDP;
 import vibe.core.core : runTask;
+import vibe.core.task : Task;
 
 // Diagnostic: HS_UDX_SEND_TRACE=1 logs which send path fires and the real fd, to
 // catch a beacon leaving a different socket than the holder (holepunch rig).
@@ -53,6 +54,7 @@ private enum int MSG_DONTWAIT = 0x40;
 // libuv error codes we return (mirroring the shim's negative-errno convention).
 private enum int UV_EAGAIN = -EAGAIN;
 private enum int UV_EINVAL = -22;
+private enum int UV_ECANCELED = -125;
 
 // ── C struct layouts (must match vendor/libudx-shim/uv.h) ────────────────────
 
@@ -135,6 +137,7 @@ private struct PendingClose
 {
     uv_handle_t* handle;
     CCloseCb cb;
+    UdpState udp; // set for a UDP handle: its send queue is settled before cb runs
 }
 
 /// A prepare or check handle: its callback runs each loop iteration while active
@@ -147,15 +150,43 @@ private struct PhaseHook
 
 /// Per-UDP-socket state. The vibe UDPConnection carries the socket; a reader
 /// fiber turns its blocking recv into libuv's alloc_cb+recv_cb callbacks.
+// One queued libuv-style send: data already coalesced, completion callback kept.
+private struct PendingSend
+{
+    void* req;
+    ubyte[] data;
+    NetworkAddress peer;
+    CSendCb cb;
+}
+
 private final class UdpState
 {
     Loop loop;
     uv_udp_t* handle;
     UDPConnection conn;
+    // uv_udp_send semantics: sends are QUEUED and completed in order by ONE drain
+    // fiber per socket. A vibe UDPConnection tolerates a single send in flight —
+    // eventcore keeps one write callback per socket — so a burst that fills the
+    // kernel buffer must wait its turn here, never fan out into parallel sends.
+    PendingSend[] sendQueue;
+    bool draining;
+    bool closing; // close started: no new sends; the queue is cancelled before the close cb
+    bool aborting; // shutdown: sends are cancelled (UV_ECANCELED) instead of waited for
     int family; // 4 or 6, from the bound address
     bool bound;
     bool receiving;
+    // The reader fiber (parked in conn.recv between datagrams). Kept so a close can
+    // interrupt it: closing the UDPConnection alone does not wake a parked recv, which
+    // then holds the socket's eventcore handle — the FD stays bound, the fiber lives on.
+    Task reader;
+    Task drainer; // the send-drain fiber (a close interrupts it if it is blocked in send)
     CAllocCb allocCb;
+
+    /// Whether the reader fiber is still alive (Task.running asserts on a null handle).
+    bool readerAlive() nothrow
+    {
+        return reader != Task.init && reader.running;
+    }
     CRecvCb recvCb;
 
     this(Loop l, uv_udp_t* h) nothrow
@@ -263,8 +294,53 @@ final class Loop
         auto cs = pendingCloses;
         pendingCloses = null;
         foreach (c; cs)
+        {
+            if (c.udp !is null)
+            {
+                if (c.udp.draining)
+                {
+                    // The drain fiber is inside its current send; it stops at the closing
+                    // flag right after. If that send is blocked (the socket buffer full),
+                    // interrupt it: uv_close cancels in-flight requests, and its callback
+                    // then completes with UV_ECANCELED. Settle this handle when it pokes.
+                    if (c.udp.drainer != Task.init && c.udp.drainer.running && Task.getThis() != c.udp.drainer)
+                        c.udp.drainer.interrupt();
+                    pendingCloses ~= c;
+                    continue;
+                }
+                if (c.udp.readerAlive())
+                {
+                    // Parked in recv: wake it with an interrupt (its recv throws, the
+                    // loop exits). This runs on the loop task — never inside a C
+                    // callback and never on the reader itself (a task cannot interrupt
+                    // itself). A reader that started this close from its own recv
+                    // callback just returns: `receiving` is already false.
+                    if (Task.getThis() != c.udp.reader)
+                        c.udp.reader.interrupt();
+                    pendingCloses ~= c;
+                    continue;
+                }
+                cancelSends(c.udp);
+                // Only now, with no fiber left on the socket, release it.
+                try
+                    c.udp.conn.close();
+                catch (Exception)
+                {
+                }
+            }
             if (c.cb !is null)
                 c.cb(c.handle);
+        }
+        // A close requeued above waits for a fiber (the drain fiber finishing its send,
+        // the interrupted reader unwinding); each pokes the loop as it exits. Poking
+        // here instead would make the next wait return at once — a busy spin that
+        // starves exactly the fiber being waited for.
+    }
+
+    /// Whether any handle close is still waiting to run its callback (tests).
+    bool closesPending() const nothrow @safe
+    {
+        return pendingCloses.length != 0;
     }
 
     // Run active prepare/check hooks. Collect first: a hook may start/stop hooks.
@@ -295,6 +371,12 @@ final class Loop
         updateNow();
         while (running)
         {
+            // Snapshot the wake counter BEFORE this iteration's callbacks: a poke()
+            // they issue (drainCloses asking for another pass while a closing socket's
+            // fibers unwind, a timer (re)started, a hook armed) must end the wait below
+            // at once. Snapshotting after them swallowed that poke and parked the loop
+            // until the next timer — a deferred socket close then took a timer period.
+            immutable cnt = wake.emitCount;
             fireExpired();
             drainCloses();
             if (!running)
@@ -304,7 +386,6 @@ final class Loop
             if (!running)
                 break;
 
-            immutable cnt = wake.emitCount;
             ulong next;
             if (nextDeadline(next))
             {
@@ -318,6 +399,35 @@ final class Loop
 
             runHooks(checks); // libuv "check" phase — after the poll
         }
+        // Stopped — but handle closes may still be in flight (a socket closed from a
+        // callback just before stop(): its reader must be woken and its fd released,
+        // and libudx waits for the close callback). Settle them before the runner
+        // returns; the short waits let the interrupted reader/drain fibers unwind.
+        for (int i = 0; i < 400 && pendingCloses.length; i++)
+        {
+            drainCloses();
+            if (pendingCloses.length == 0)
+                break;
+            immutable cnt = wake.emitCount;
+            wake.wait(5.msecs, cnt);
+        }
+    }
+
+    /// Shutdown: cancel every send still queued or blocked on a full socket buffer, on
+    /// every socket of this loop. A stream's DESTROY packet stuck behind a blocked send
+    /// keeps the stream linked to its socket (the socket close says UV_EBUSY and never
+    /// even starts); cancelling completes those sends so the streams can finish closing.
+    void abortSends() nothrow
+    {
+        foreach (udp; udps)
+        {
+            udp.aborting = true;
+            if (udp.draining && udp.drainer != Task.init && udp.drainer.running && Task.getThis() != udp.drainer)
+                udp.drainer.interrupt();
+            else if (!udp.draining)
+                cancelSends(udp);
+        }
+        poke();
     }
 
     void stop() nothrow
@@ -398,14 +508,15 @@ final class Loop
     private void closeHandle(uv_handle_t* h, CCloseCb cb) nothrow
     {
         auto key = cast(void*) h;
+        UdpState udp;
         if (auto st = key in udps)
         {
-            st.receiving = false;
-            try
-                st.conn.close();
-            catch (Exception)
-            {
-            }
+            udp = *st;
+            udp.closing = true; // no new sends; the drain fiber stops after its current one
+            udp.receiving = false; // the reader stops after its current datagram
+            // The UDPConnection stays open until drainCloses has stopped both fibers:
+            // closing it here (possibly inside a libudx callback, possibly on the reader
+            // itself) would strand a parked recv. Deferred to the loop instead.
             udps.remove(key);
         }
         timers.remove(key);
@@ -413,8 +524,12 @@ final class Loop
         checks.remove(key);
         h.active = 0;
         h.closing = 1;
-        if (cb !is null)
-            pendingCloses ~= PendingClose(h, cb);
+        // libuv's contract: every request on the handle completes or is cancelled
+        // BEFORE the handle's close callback. The pending close carries the UDP
+        // state so drainCloses can settle its send queue first (and wait for the
+        // drain fiber to finish the one send it may have in flight).
+        if (cb !is null || udp !is null)
+            pendingCloses ~= PendingClose(h, cb, udp);
         poke();
     }
 }
@@ -429,69 +544,18 @@ private UdpState udpOf(uv_handle_t* h) nothrow
     return cast(UdpState) h.impl;
 }
 
-// ── the hsuv_* facade (C ABI, nothrow) ───────────────────────────────────────
-
-extern (C):
+// ── the __d_hsuv_* facade (C linkage, nothrow) ───────────────────────────────────
+// Implemented as extern(C++, "udx") so they are udx::__d_hsuv_* — C++-mangled, NOT
+// global C symbols — matching the shim's namespaced prototypes; nothing leaks.
+// Every parameter is void*/int/uint/ulong/char*, mirroring the shim exactly, so
+// the mangled names agree without mirroring any uv struct type in D.
 
 private noreturn nyi(string what) nothrow
 {
     assert(0, what);
 }
 
-// ── loop / time ──────────────────────────────────────────────────────────────
-ulong hsuv_now(const(void)* loop) nothrow
-{
-    return loopOf(cast(void*) loop).nowMs;
-}
-
-ulong hsuv_hrtime() nothrow
-{
-    immutable t = MonoTime.currTime.ticks;
-    immutable freq = MonoTime.ticksPerSecond;
-    return cast(ulong)(t / freq) * 1_000_000_000UL
-        + cast(ulong)((t % freq) * 1_000_000_000UL / freq);
-}
-
-// ── buffers ──────────────────────────────────────────────────────────────────
-uv_buf_t hsuv_buf_init(char* base, uint len) nothrow
-{
-    return uv_buf_t(base, len);
-}
-
-// ── handles ──────────────────────────────────────────────────────────────────
-void hsuv_close(void* handle, void* close_cb) nothrow
-{
-    auto h = cast(uv_handle_t*) handle;
-    if (h.loop !is null)
-        loopOf(cast(void*) h.loop).closeHandle(h, cast(CCloseCb) close_cb);
-}
-
-int hsuv_is_active(const(void)* handle) nothrow
-{
-    return (cast(uv_handle_t*) handle).active;
-}
-
-int hsuv_fileno(const(void)* handle, int* fd) nothrow
-{
-    auto st = udpOf(cast(uv_handle_t*) handle);
-    if (st is null || !st.bound)
-        return UV_EINVAL;
-    *fd = st.fd;
-    return 0;
-}
-
-int hsuv_recv_buffer_size(void* handle, int* value) nothrow
-{
-    return bufferSize(cast(uv_handle_t*) handle, SO_RCVBUF, value);
-}
-
-int hsuv_send_buffer_size(void* handle, int* value) nothrow
-{
-    return bufferSize(cast(uv_handle_t*) handle, SO_SNDBUF, value);
-}
-
-// libuv semantics: *value == 0 → get current into *value; else set it. Linux
-// doubles the SO_*BUF value it stores, matching what libuv reports.
+// ── private helpers of the shim (D linkage; must stay out of the C/C++ block) ──
 private int bufferSize(uv_handle_t* h, int opt, int* value) nothrow @trusted
 {
     auto st = udpOf(h);
@@ -508,110 +572,82 @@ private int bufferSize(uv_handle_t* h, int opt, int* value) nothrow @trusted
     return 0;
 }
 
-// ── timers ───────────────────────────────────────────────────────────────────
-int hsuv_timer_init(void* loop, void* handle) nothrow
+// The tasks currently running libudx callbacks off the loop task: the UDP readers and
+// send drains for their whole life, and any task inside a stream close callback (a
+// Connection.destroy() on an ordinary task reaches onClose synchronously). Their
+// callbacks can reach application code that starts a blocking shutdown; see
+// insideUdxCallback. One entry per enter (they nest).
+private Task[] ioTasks;
+
+// Tasks inside a stream close callback right now (one entry per frame; they nest).
+// Unlike ioTasks these frames END: a shutdown waits for them (udxCallbacksActive),
+// because libudx only queues the stream's finalizer handles after its callback returns.
+private Task[] callbackFrames;
+
+/// Mark the calling task as inside a udx callback until the matching udxCallbackLeave.
+void udxCallbackEnter() nothrow
 {
-    auto h = cast(uv_handle_t*) handle;
-    h.loop = cast(uv_loop_t*) loop;
-    h.type = UV_TIMER;
-    h.active = 0;
-    h.closing = 0;
-    loopOf(loop).registerTimer(handle);
-    return 0;
+    callbackFrames ~= Task.getThis();
 }
 
-int hsuv_timer_start(void* handle, void* cb, ulong timeout, ulong repeat) nothrow
+/// ditto
+void udxCallbackLeave() nothrow
 {
-    auto h = cast(uv_handle_t*) handle;
-    h.active = 1;
-    loopOf(cast(void*) h.loop).startTimer(handle, cast(CTimerCb) cb, timeout, repeat);
-    return 0;
+    auto me = Task.getThis();
+    foreach (i, t; callbackFrames)
+        if (t == me)
+        {
+            callbackFrames = callbackFrames[0 .. i] ~ callbackFrames[i + 1 .. $];
+            return;
+        }
 }
 
-int hsuv_timer_stop(void* handle) nothrow
+/// Whether some task is still inside a stream close callback (see callbackFrames).
+bool udxCallbacksActive() nothrow
 {
-    auto h = cast(uv_handle_t*) handle;
-    h.active = 0;
-    if (h.loop !is null)
-        loopOf(cast(void*) h.loop).stopTimer(handle);
-    return 0;
+    return callbackFrames.length != 0;
 }
 
-// ── UDP ──────────────────────────────────────────────────────────────────────
-int hsuv_udp_init(void* loop, void* handle) nothrow
+private void enterIoTask() nothrow
 {
-    auto h = cast(uv_handle_t*) handle;
-    h.loop = cast(uv_loop_t*) loop;
-    h.type = UV_UDP;
-    h.active = 0;
-    h.closing = 0;
-    auto lp = loopOf(loop);
-    auto st = new UdpState(lp, h);
-    h.impl = cast(void*) st;
-    lp.registerUdp(handle, st);
-    return 0;
+    ioTasks ~= Task.getThis();
 }
 
-int hsuv_udp_bind(void* handle, const(void)* addr, uint flags) nothrow
+private void leaveIoTask() nothrow
 {
-    auto h = cast(uv_handle_t*) handle;
-    auto st = udpOf(h);
-    if (st is null)
-        return UV_EINVAL;
-    auto sa = cast(const(sockaddr)*) addr;
-    try
-    {
-        auto na = toNetworkAddress(sa);
-        st.conn = listenUDP(na);
-        st.family = sa.sa_family == AF_INET ? 4 : 6;
-        st.bound = true;
-        h.active = 1;
-    }
-    catch (Exception)
-        return UV_EINVAL;
-    return 0;
+    auto me = Task.getThis();
+    foreach (i, t; ioTasks)
+        if (t == me)
+        {
+            ioTasks = ioTasks[0 .. i] ~ ioTasks[i + 1 .. $];
+            return;
+        }
 }
 
-int hsuv_udp_getsockname(const(void)* handle, void* name, int* namelen) nothrow
+/// Whether the calling task is inside a udx callback (a UDP reader or send drain, or a
+/// stream close callback). A shutdown started from there must not block on the loop: the
+/// loop cannot finish closing that socket until this very frame returns.
+bool insideUdxCallback() nothrow
 {
-    auto st = udpOf(cast(uv_handle_t*) handle);
-    if (st is null || !st.bound)
-        return UV_EINVAL;
-    try
-    {
-        auto na = st.conn.localAddress;
-        immutable len = na.sockAddrLen;
-        (cast(ubyte*) name)[0 .. len] = (cast(ubyte*) na.sockAddr)[0 .. len];
-        *namelen = len;
-    }
-    catch (Exception)
-        return UV_EINVAL;
-    return 0;
+    auto me = Task.getThis();
+    foreach (t; ioTasks)
+        if (t == me)
+            return true;
+    foreach (t; callbackFrames)
+        if (t == me)
+            return true;
+    return false;
 }
 
-int hsuv_udp_recv_start(void* handle, void* alloc_cb, void* recv_cb) nothrow
-{
-    auto h = cast(uv_handle_t*) handle;
-    auto st = udpOf(h);
-    if (st is null || !st.bound)
-        return UV_EINVAL;
-    st.allocCb = cast(CAllocCb) alloc_cb;
-    st.recvCb = cast(CRecvCb) recv_cb;
-    if (st.receiving)
-        return 0;
-    st.receiving = true;
-    try
-        runTask(&readerLoop, st);
-    catch (Exception)
-        return UV_EINVAL;
-    return 0;
-}
-
-// The bridge: turn vibe's blocking recv into libuv's alloc_cb + recv_cb. Runs on
-// its own fiber; the callbacks it invokes are libudx C and never yield, so they
-// are atomic w.r.t. the loop runner and timers.
 private void readerLoop(UdpState st) nothrow
 {
+    enterIoTask();
+    scope (exit)
+    {
+        leaveIoTask();
+        if (st.closing)
+            st.loop.poke(); // a close is waiting for this reader to exit
+    }
     while (st.receiving)
     {
         uv_buf_t buf;
@@ -631,10 +667,236 @@ private void readerLoop(UdpState st) nothrow
     }
 }
 
-int hsuv_udp_send(void* req, void* handle, const(uv_buf_t)* bufs, uint nbufs, const(void)* addr, void* send_cb) nothrow
+private void drainSends(UdpState st) nothrow
+{
+    enterIoTask();
+    scope (exit)
+    {
+        leaveIoTask();
+        if (st.aborting && !st.closing)
+            cancelSends(st); // shutdown: nothing more goes out on this socket
+        st.draining = false;
+        if (st.closing)
+            st.loop.poke(); // let drainCloses settle the rest and run the close cb
+    }
+    while (st.sendQueue.length && !st.closing && !st.aborting)
+    {
+        auto s = st.sendQueue[0];
+        st.sendQueue = st.sendQueue[1 .. $];
+        int status = 0;
+        try
+            st.conn.send(s.data, &s.peer);
+        catch (Exception)
+            status = st.closing || st.aborting ? UV_ECANCELED : -1;
+        if (s.cb !is null)
+            s.cb(s.req, status);
+    }
+}
+
+// The handle is closing: every send still queued completes with UV_ECANCELED,
+// in order, before the handle's close callback (libuv semantics).
+private void cancelSends(UdpState st) nothrow
+{
+    auto q = st.sendQueue;
+    st.sendQueue = null;
+    foreach (s; q)
+        if (s.cb !is null)
+            s.cb(s.req, UV_ECANCELED);
+}
+
+private int hookInit(void* loop, void* handle, int type) nothrow
+{
+    auto h = cast(uv_handle_t*) handle;
+    h.loop = cast(uv_loop_t*) loop;
+    h.type = type;
+    h.active = 0;
+    h.closing = 0;
+    auto lp = loopOf(loop);
+    lp.registerHook(type == UV_PREPARE ? lp.prepares : lp.checks, handle);
+    return 0;
+}
+
+
+/// The __d_hsuv_* shim: the libuv surface libudx calls, provided by D. libudx is built
+/// as plain C on every target (vendor/build-libudx.sh) and references these as C
+/// symbols; every libudx internal is localized by the linker there, so nothing but
+/// hs_udx_* and these __d_hsuv_* names cross the C/D boundary.
+extern (C):
+
+// ── loop / time ──────────────────────────────────────────────────────────────
+ulong __d_hsuv_now(const(void)* loop) nothrow
+{
+    // Fresh, not the per-iteration cache libuv keeps: here the socket reader and
+    // the loop are different fibers, so an ack can be processed while the loop
+    // fiber is parked in its wait and its cached clock is stale — libudx then
+    // sees zero RTTs and a frozen token-bucket refill, and BBR paces to a crawl.
+    auto l = loopOf(cast(void*) loop);
+    l.updateNow();
+    return l.nowMs;
+}
+
+ulong __d_hsuv_hrtime() nothrow
+{
+    immutable t = MonoTime.currTime.ticks;
+    immutable freq = MonoTime.ticksPerSecond;
+    return cast(ulong)(t / freq) * 1_000_000_000UL
+        + cast(ulong)((t % freq) * 1_000_000_000UL / freq);
+}
+
+// ── buffers ──────────────────────────────────────────────────────────────────
+uv_buf_t __d_hsuv_buf_init(char* base, uint len) nothrow
+{
+    return uv_buf_t(base, len);
+}
+
+// ── handles ──────────────────────────────────────────────────────────────────
+void __d_hsuv_close(void* handle, void* close_cb) nothrow
+{
+    auto h = cast(uv_handle_t*) handle;
+    if (h.loop !is null)
+        loopOf(cast(void*) h.loop).closeHandle(h, cast(CCloseCb) close_cb);
+}
+
+int __d_hsuv_is_active(const(void)* handle) nothrow
+{
+    return (cast(uv_handle_t*) handle).active;
+}
+
+int __d_hsuv_fileno(const(void)* handle, int* fd) nothrow
 {
     auto st = udpOf(cast(uv_handle_t*) handle);
     if (st is null || !st.bound)
+        return UV_EINVAL;
+    *fd = st.fd;
+    return 0;
+}
+
+int __d_hsuv_recv_buffer_size(void* handle, int* value) nothrow
+{
+    return bufferSize(cast(uv_handle_t*) handle, SO_RCVBUF, value);
+}
+
+int __d_hsuv_send_buffer_size(void* handle, int* value) nothrow
+{
+    return bufferSize(cast(uv_handle_t*) handle, SO_SNDBUF, value);
+}
+
+// libuv semantics: *value == 0 → get current into *value; else set it. Linux
+// doubles the SO_*BUF value it stores, matching what libuv reports.
+
+// ── timers ───────────────────────────────────────────────────────────────────
+int __d_hsuv_timer_init(void* loop, void* handle) nothrow
+{
+    auto h = cast(uv_handle_t*) handle;
+    h.loop = cast(uv_loop_t*) loop;
+    h.type = UV_TIMER;
+    h.active = 0;
+    h.closing = 0;
+    loopOf(loop).registerTimer(handle);
+    return 0;
+}
+
+int __d_hsuv_timer_start(void* handle, void* cb, ulong timeout, ulong repeat) nothrow
+{
+    auto h = cast(uv_handle_t*) handle;
+    h.active = 1;
+    loopOf(cast(void*) h.loop).startTimer(handle, cast(CTimerCb) cb, timeout, repeat);
+    return 0;
+}
+
+int __d_hsuv_timer_stop(void* handle) nothrow
+{
+    auto h = cast(uv_handle_t*) handle;
+    h.active = 0;
+    if (h.loop !is null)
+        loopOf(cast(void*) h.loop).stopTimer(handle);
+    return 0;
+}
+
+// ── UDP ──────────────────────────────────────────────────────────────────────
+int __d_hsuv_udp_init(void* loop, void* handle) nothrow
+{
+    auto h = cast(uv_handle_t*) handle;
+    h.loop = cast(uv_loop_t*) loop;
+    h.type = UV_UDP;
+    h.active = 0;
+    h.closing = 0;
+    auto lp = loopOf(loop);
+    auto st = new UdpState(lp, h);
+    h.impl = cast(void*) st;
+    lp.registerUdp(handle, st);
+    return 0;
+}
+
+int __d_hsuv_udp_bind(void* handle, const(void)* addr, uint flags) nothrow
+{
+    auto h = cast(uv_handle_t*) handle;
+    auto st = udpOf(h);
+    if (st is null)
+        return UV_EINVAL;
+    auto sa = cast(const(sockaddr)*) addr;
+    try
+    {
+        auto na = toNetworkAddress(sa);
+        st.conn = listenUDP(na);
+        st.family = sa.sa_family == AF_INET ? 4 : 6;
+        st.bound = true;
+        h.active = 1;
+    }
+    catch (Exception)
+        return UV_EINVAL;
+    return 0;
+}
+
+int __d_hsuv_udp_getsockname(const(void)* handle, void* name, int* namelen) nothrow
+{
+    auto st = udpOf(cast(uv_handle_t*) handle);
+    if (st is null || !st.bound)
+        return UV_EINVAL;
+    try
+    {
+        auto na = st.conn.localAddress;
+        immutable len = na.sockAddrLen;
+        (cast(ubyte*) name)[0 .. len] = (cast(ubyte*) na.sockAddr)[0 .. len];
+        *namelen = len;
+    }
+    catch (Exception)
+        return UV_EINVAL;
+    return 0;
+}
+
+int __d_hsuv_udp_recv_start(void* handle, void* alloc_cb, void* recv_cb) nothrow
+{
+    auto h = cast(uv_handle_t*) handle;
+    auto st = udpOf(h);
+    if (st is null || !st.bound)
+        return UV_EINVAL;
+    st.allocCb = cast(CAllocCb) alloc_cb;
+    st.recvCb = cast(CRecvCb) recv_cb;
+    if (st.receiving)
+        return 0;
+    st.receiving = true;
+    if (st.readerAlive())
+        return 0; // the previous reader is still parked in recv: it resumes receiving
+    try
+        st.reader = runTask(&readerLoop, st);
+    catch (Exception)
+    {
+        st.receiving = false; // the reader never started; leave the socket re-armable
+        return UV_EINVAL;
+    }
+    return 0;
+}
+
+// The bridge: turn vibe's blocking recv into libuv's alloc_cb + recv_cb. Runs on
+// its own fiber; the callbacks it invokes are libudx C and never yield, so they
+// are atomic w.r.t. the loop runner and timers.
+
+int __d_hsuv_udp_send(void* req, void* handle, const(void)* bufsRaw, uint nbufs, const(void)* addr, void* send_cb) nothrow
+{
+    auto bufs = cast(const(uv_buf_t)*) bufsRaw;
+    auto st = udpOf(cast(uv_handle_t*) handle);
+    if (st is null || !st.bound || st.closing)
         return UV_EINVAL;
     auto cb = cast(CSendCb) send_cb;
     try
@@ -653,27 +915,39 @@ int hsuv_udp_send(void* req, void* handle, const(uv_buf_t)* bufs, uint nbufs, co
             off += bufs[i].len;
         }
         auto peer = toNetworkAddress(cast(const(sockaddr)*) addr);
-        auto conn = st.conn;
         if (sendTraceOn())
-            fprintf(stderr, "[facade] SLOW udp_send fd=%d bound=%d\n", st.fd,
-                cast(int) conn.localAddress.port);
-        runTask(() nothrow {
-            int status = 0;
+            fprintf(stderr, "[facade] SLOW udp_send fd=%d bound=%d queued=%zu\n", st.fd,
+                cast(int) st.conn.localAddress.port, st.sendQueue.length);
+        st.sendQueue ~= PendingSend(req, data, peer, cb);
+        if (!st.draining)
+        {
+            st.draining = true;
             try
-                conn.send(data, &peer);
+                st.drainer = runTask(() nothrow { drainSends(st); });
             catch (Exception)
-                status = -1;
-            if (cb !is null)
-                cb(req, status);
-        });
+            {
+                // The drain fiber never started: undo the queue mutation and report
+                // failure, so libudx frees its request and no later close callbacks
+                // it with a stale pointer, and the socket is not wedged un-draining.
+                st.draining = false;
+                if (st.sendQueue.length && st.sendQueue[$ - 1].req is req)
+                    st.sendQueue = st.sendQueue[0 .. $ - 1];
+                return UV_EINVAL;
+            }
+        }
     }
     catch (Exception)
         return UV_EINVAL;
     return 0;
 }
 
-int hsuv_udp_try_send(void* handle, const(uv_buf_t)* bufs, uint nbufs, const(void)* addr) nothrow @trusted
+// The one sender per socket: pops sends in order, each one blocking on a full
+// socket buffer (vibe waits for writability), and fires its completion callback
+// from this fiber — cooperative, so atomic with respect to libudx.
+
+int __d_hsuv_udp_try_send(void* handle, const(void)* bufsRaw, uint nbufs, const(void)* addr) nothrow @trusted
 {
+    auto bufs = cast(const(uv_buf_t)*) bufsRaw;
     auto st = udpOf(cast(uv_handle_t*) handle);
     if (st is null || !st.bound)
         return UV_EINVAL;
@@ -692,7 +966,7 @@ int hsuv_udp_try_send(void* handle, const(uv_buf_t)* bufs, uint nbufs, const(voi
     return cast(int) n;
 }
 
-int hsuv_udp_set_ttl(void* handle, int ttl) nothrow @trusted
+int __d_hsuv_udp_set_ttl(void* handle, int ttl) nothrow @trusted
 {
     auto st = udpOf(cast(uv_handle_t*) handle);
     if (st is null || !st.bound)
@@ -705,30 +979,19 @@ int hsuv_udp_set_ttl(void* handle, int ttl) nothrow @trusted
     return r == 0 ? 0 : -errno;
 }
 
-int hsuv_udp_set_multicast_loop(void* handle, int on) nothrow { return 0; }
-int hsuv_udp_set_multicast_interface(void* handle, const(char)* interface_addr) nothrow { return 0; }
-int hsuv_udp_set_membership(void* handle, const(char)* multicast_addr, const(char)* interface_addr, int membership) nothrow { return 0; }
-int hsuv_udp_set_source_membership(void* handle, const(char)* multicast_addr, const(char)* interface_addr, const(char)* source_addr, int membership) nothrow { return 0; }
+int __d_hsuv_udp_set_multicast_loop(void* handle, int on) nothrow { return 0; }
+int __d_hsuv_udp_set_multicast_interface(void* handle, const(char)* interface_addr) nothrow { return 0; }
+int __d_hsuv_udp_set_membership(void* handle, const(char)* multicast_addr, const(char)* interface_addr, int membership) nothrow { return 0; }
+int __d_hsuv_udp_set_source_membership(void* handle, const(char)* multicast_addr, const(char)* interface_addr, const(char)* source_addr, int membership) nothrow { return 0; }
 
 // ── prepare / check (loop-phase hooks) ───────────────────────────────────────
-private int hookInit(void* loop, void* handle, int type) nothrow
-{
-    auto h = cast(uv_handle_t*) handle;
-    h.loop = cast(uv_loop_t*) loop;
-    h.type = type;
-    h.active = 0;
-    h.closing = 0;
-    auto lp = loopOf(loop);
-    lp.registerHook(type == UV_PREPARE ? lp.prepares : lp.checks, handle);
-    return 0;
-}
 
-int hsuv_prepare_init(void* loop, void* prepare) nothrow
+int __d_hsuv_prepare_init(void* loop, void* prepare) nothrow
 {
     return hookInit(loop, prepare, UV_PREPARE);
 }
 
-int hsuv_prepare_start(void* prepare, void* cb) nothrow
+int __d_hsuv_prepare_start(void* prepare, void* cb) nothrow
 {
     auto h = cast(uv_handle_t*) prepare;
     h.active = 1;
@@ -737,7 +1000,7 @@ int hsuv_prepare_start(void* prepare, void* cb) nothrow
     return 0;
 }
 
-int hsuv_prepare_stop(void* prepare) nothrow
+int __d_hsuv_prepare_stop(void* prepare) nothrow
 {
     auto h = cast(uv_handle_t*) prepare;
     h.active = 0;
@@ -746,12 +1009,12 @@ int hsuv_prepare_stop(void* prepare) nothrow
     return 0;
 }
 
-int hsuv_check_init(void* loop, void* check) nothrow
+int __d_hsuv_check_init(void* loop, void* check) nothrow
 {
     return hookInit(loop, check, UV_CHECK);
 }
 
-int hsuv_check_start(void* check, void* cb) nothrow
+int __d_hsuv_check_start(void* check, void* cb) nothrow
 {
     auto h = cast(uv_handle_t*) check;
     h.active = 1;
@@ -760,7 +1023,7 @@ int hsuv_check_start(void* check, void* cb) nothrow
     return 0;
 }
 
-int hsuv_check_stop(void* check) nothrow
+int __d_hsuv_check_stop(void* check) nothrow
 {
     auto h = cast(uv_handle_t*) check;
     h.active = 0;
@@ -770,15 +1033,15 @@ int hsuv_check_stop(void* check) nothrow
 }
 
 // ── DNS ──────────────────────────────────────────────────────────────────────
-int hsuv_getaddrinfo(void* loop, void* req, void* cb, const(char)* node, const(char)* service, const(void)* hints) nothrow { nyi("uv_getaddrinfo"); }
-void hsuv_freeaddrinfo(void* ai) nothrow { nyi("uv_freeaddrinfo"); }
+int __d_hsuv_getaddrinfo(void* loop, void* req, void* cb, const(char)* node, const(char)* service, const(void)* hints) nothrow { nyi("uv_getaddrinfo"); }
+void __d_hsuv_freeaddrinfo(void* ai) nothrow { nyi("uv_freeaddrinfo"); }
 
 // ── interfaces ───────────────────────────────────────────────────────────────
-int hsuv_interface_addresses(void* addresses, int* count) nothrow { nyi("uv_interface_addresses"); }
-void hsuv_free_interface_addresses(void* addresses, int count) nothrow { nyi("uv_free_interface_addresses"); }
+int __d_hsuv_interface_addresses(void* addresses, int* count) nothrow { nyi("uv_interface_addresses"); }
+void __d_hsuv_free_interface_addresses(void* addresses, int count) nothrow { nyi("uv_free_interface_addresses"); }
 
 // ── misc ─────────────────────────────────────────────────────────────────────
-const(char)* hsuv_strerror(int err) nothrow
+const(char)* __d_hsuv_strerror(int err) nothrow
 {
     // libudx only uses this for debug logging (compiled out) and assert messages;
     // a stable static string is enough. The literal is null-terminated.

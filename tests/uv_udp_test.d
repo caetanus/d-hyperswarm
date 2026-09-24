@@ -1,5 +1,5 @@
-/// UDP through the libuv→vibe facade end to end: two sockets bound via hsuv_udp_*,
-/// one sends with hsuv_udp_try_send (the raw non-blocking sendmsg path libudx uses
+/// UDP through the libuv→vibe facade end to end: two sockets bound via __d_hsuv_udp_*,
+/// one sends with __d_hsuv_udp_try_send (the raw non-blocking sendmsg path libudx uses
 /// as its fast path), the other receives via the reader fiber that drives the
 /// alloc_cb + recv_cb callbacks on the vibe loop. This is the socket layer udx's
 /// packets will ride on.
@@ -52,27 +52,32 @@ unittest
 
             // receiver
             auto rx = new uv_udp_t;
-            hsuv_udp_init(loop.chandle, rx);
-            hsuv_udp_bind(rx, cast(sockaddr*)&bindv4, 0);
+            __d_hsuv_udp_init(loop.chandle, rx);
+            __d_hsuv_udp_bind(rx, cast(sockaddr*)&bindv4, 0);
             sockaddr_storage rxname;
             int rxnamelen = cast(int) rxname.sizeof;
-            hsuv_udp_getsockname(rx, &rxname, &rxnamelen);
-            hsuv_udp_recv_start(rx, &allocCb, &recvCb);
+            __d_hsuv_udp_getsockname(rx, &rxname, &rxnamelen);
+            __d_hsuv_udp_recv_start(rx, &allocCb, &recvCb);
 
             // sender
             auto tx = new uv_udp_t;
-            hsuv_udp_init(loop.chandle, tx);
-            hsuv_udp_bind(tx, cast(sockaddr*)&bindv4, 0);
+            __d_hsuv_udp_init(loop.chandle, tx);
+            __d_hsuv_udp_bind(tx, cast(sockaddr*)&bindv4, 0);
 
-            runTask(() nothrow { try loop.run(); catch (Exception) {} });
+            auto loopTask = runTask(() nothrow { try loop.run(); catch (Exception) {} });
 
             sleep(25.msecs); // let the reader arm
             string payload = "hello";
             auto b = uv_buf_t(cast(char*) payload.ptr, payload.length);
-            hsuv_udp_try_send(tx, &b, 1, cast(sockaddr*)&rxname);
+            __d_hsuv_udp_try_send(tx, &b, 1, cast(sockaddr*)&rxname);
 
             sleep(120.msecs);
+            // close both handles (the reader is woken and the fds released) before stopping
+            __d_hsuv_close(rx, null);
+            __d_hsuv_close(tx, null);
+            sleep(20.msecs);
             loop.stop();
+            loopTask.join(); // let the runner return, so no task outlives the test
         }
         catch (Exception)
         {
@@ -88,3 +93,4 @@ unittest
     g_rxlen.should.equal(5);
     (cast(string) g_rx[0 .. 5].idup).should.equal("hello");
 }
+

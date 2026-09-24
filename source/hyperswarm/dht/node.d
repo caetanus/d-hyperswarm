@@ -7,6 +7,7 @@ module hyperswarm.dht.node;
 
 import hyperswarm.dht.rpc : Rpc;
 import hyperswarm.dht.socket_pool : SocketPool;
+import hyperswarm.dht.holepuncher : RandomPunchGate;
 import hyperswarm.dht.wire : FIND_NODE, nodeId, Reply;
 import hyperswarm.dht.table : RoutingTable, Node, compareDistance;
 import hyperswarm.dht.messages : PeerRecord, Announce, encodeAnnounce, signAnnounce,
@@ -25,6 +26,8 @@ final class Dht
     ubyte[32] id;
     Address[] bootstrap;
     private SocketPool _pool; // lazily created; the holepuncher's short-lived sockets
+    /// The DHT-wide random-punch throttle every holepuncher of this node shares.
+    RandomPunchGate randomPunchGate;
 
     this(Address[] bootstrap, ushort bindPort = 0)
     {
@@ -35,6 +38,7 @@ final class Dht
             b = cast(ubyte) uniform(0, 256);
         this.table = new RoutingTable(id);
         this.bootstrap = bootstrap;
+        this.randomPunchGate = new RandomPunchGate();
     }
 
     /// The pool of short-lived udx sockets the holepuncher punches from (hyperdht's
@@ -49,7 +53,12 @@ final class Dht
     void close()
     {
         if (_pool !is null)
+        {
             _pool.closeAll();
+            // a pool socket still carrying a stream (UV_EBUSY) closes on a later retry
+            auto pool = _pool;
+            rpc.onCloseRetry = () nothrow { pool.closeAll(); return pool.openCount() == 0; };
+        }
         rpc.close();
     }
 
@@ -63,6 +72,19 @@ final class Dht
         return n.host ~ ":" ~ n.port.to!string;
     }
 
+    /// A node our last announce landed on, with our address as that node saw us —
+    /// hyperdht's announcer.relays: the (relayAddress, peerAddress) pairs a server
+    /// hands a firewalled client so its PEER_HOLEPUNCH rounds reach us through a
+    /// node that already knows our mapping.
+    struct AnnounceRelay
+    {
+        Address relay;
+        Address observed;
+    }
+
+    /// Set by announce(): the nodes that accepted it, closest first.
+    AnnounceRelay[] announceRelays;
+
     /// A responded query node with its token and reply value.
     struct QReply
     {
@@ -75,7 +97,7 @@ final class Dht
     /// built-in FIND_NODE routing, false for hyperdht LOOKUP/ANNOUNCE). Returns the
     /// responded nodes (with token + value) closest first.
     QReply[] query(ubyte[32] target, uint command, scope const(ubyte)[] value,
-        bool internal, int k, Duration per)
+        bool internal, int k, Duration per, void delegate(QReply) nothrow onReply = null)
     {
         Node[string] nodes;
         bool[string] queried;
@@ -108,7 +130,45 @@ final class Dht
             return r;
         }
 
-        foreach (_; 0 .. 80)
+        // Kademlia-style parallel walk: up to `alpha` requests in flight toward the
+        // closest unqueried nodes; a reply's closerNodes join the pool; stop when
+        // every unqueried node is farther than the k-th responder and nothing is
+        // in flight. Serial with 2-3 s timeouts on the nodes that never answer, a
+        // public-DHT walk took 6-13 s; the punch after it takes 2.
+        import vibe.core.core : runTask;
+        import vibe.core.sync : createManualEvent;
+        enum alpha = 3;
+        enum maxQueried = 80;
+        size_t inFlight, launched;
+        auto changed = createManualEvent();
+        import vibe.core.core : Task;
+        Task[] tasks;
+        // An interrupt of the walk (a caller giving up) cancels the α requests in
+        // flight and joins them: no child outlives the walk.
+        void settle() nothrow
+        {
+            foreach (t; tasks)
+                if (t.running)
+                    try
+                        t.interrupt();
+                    catch (Exception)
+                    {
+                    }
+            while (inFlight > 0)
+            {
+                try
+                {
+                    auto ec = changed.emitCount;
+                    changed.wait(ec);
+                }
+                catch (Exception)
+                {
+                }
+            }
+        }
+        scope (exit)
+            settle();
+        while (true)
         {
             string best;
             foreach (key, ref n; nodes)
@@ -118,36 +178,66 @@ final class Dht
                 if (best is null || compareDistance(n.id[], nodes[best].id[], target[]) < 0)
                     best = key;
             }
-            if (best is null)
-                break;
-
-            auto resp = respondedSorted();
-            if (resp.length >= k && compareDistance(nodes[best].id[], resp[k - 1].from.id[], target[]) > 0)
-                break;
-
-            queried[best] = true;
-            auto n = nodes[best];
-            Reply rep;
-            try
-                rep = rpc.request(Address(n.host, 4, n.port), command, target[], value, null, internal, per);
-            catch (Exception)
-                continue;
-            table.add(n);
-            // use the node's self-reported id (what it signs/verifies announces
-            // against) when present, else the id derived from its address.
-            if (rep.id.length == 32)
-                n.id[] = rep.id[];
-            replies[best] = QReply(n, rep.token, rep.value);
-            foreach (cn; rep.closerNodes)
+            bool launch = best !is null && launched < maxQueried && inFlight < alpha;
+            if (launch)
             {
-                Node m;
-                m.id = nodeId(cn.host, cn.port);
-                m.host = cn.host;
-                m.port = cn.port;
-                add(m);
+                auto resp = respondedSorted();
+                if (resp.length >= k && compareDistance(nodes[best].id[], resp[k - 1].from.id[], target[]) > 0)
+                    launch = false; // nothing closer left to ask
             }
+            if (launch)
+            {
+                queried[best] = true;
+                launched++;
+                inFlight++;
+                auto n = nodes[best];
+                auto key = best;
+                try
+                tasks ~= runTask((Node n, string key) nothrow {
+                    scope (exit)
+                        inFlight--;
+                    scope (exit)
+                        changed.emit(); // nothrow: wakes the walk whatever happened here
+                    Reply rep;
+                    try
+                        rep = rpc.request(Address(n.host, 4, n.port), command, target[], value, null, internal, per);
+                    catch (Exception)
+                        return;
+                    try
+                    {
+                        table.add(n);
+                        // use the node's self-reported id (what it signs/verifies announces
+                        // against) when present, else the id derived from its address.
+                        if (rep.id.length == 32)
+                            n.id[] = rep.id[];
+                        replies[key] = QReply(n, rep.token, rep.value);
+                        if (onReply !is null)
+                            onReply(replies[key]); // streamed: a caller may act before the walk ends
+                        foreach (cn; rep.closerNodes)
+                        {
+                            Node m;
+                            m.id = nodeId(cn.host, cn.port);
+                            m.host = cn.host;
+                            m.port = cn.port;
+                            add(m);
+                        }
+                    }
+                    catch (Exception)
+                    {
+                    }
+                }, n, key);
+                catch (Exception)
+                {
+                    inFlight--; // the child never started
+                    launched--;
+                }
+                continue;
+            }
+            if (inFlight == 0)
+                break; // nothing to launch, nothing pending: the walk is over
+            auto ec = changed.emitCount;
+            changed.wait(ec);
         }
-
         auto result = respondedSorted();
         return result[0 .. min(k, result.length)];
     }
@@ -159,6 +249,36 @@ final class Dht
         foreach (q; query(target, FIND_NODE, null, true, k, per))
             outp ~= q.from;
         return outp;
+    }
+
+    /// Look up the peers announced under `topic`, handing each record to `each` the
+    /// moment a node returns it — the walk to the k closest nodes goes on meanwhile.
+    /// A client that connects on the first record saves the rest of the walk
+    /// (seconds on the public DHT). Duplicates (the same key from several nodes)
+    /// are delivered once.
+    void lookupEach(ubyte[32] topic, void delegate(PeerRecord) nothrow each, int k = 20,
+        Duration per = 2.seconds)
+    {
+        bool[string] seenPk;
+        cast(void) query(topic, HS_LOOKUP, null, false, k, per, (QReply q) nothrow {
+            if (q.value.length == 0)
+                return;
+            try
+            {
+                auto lr = decodeLookupReply(q.value);
+                foreach (p; lr.peers)
+                {
+                    immutable pk = format("%(%02x%)", p.publicKey[]);
+                    if (pk in seenPk)
+                        continue;
+                    seenPk[pk] = true;
+                    each(p);
+                }
+            }
+            catch (Exception)
+            {
+            }
+        });
     }
 
     /// Look up the peers announced under `topic`.
@@ -189,6 +309,25 @@ final class Dht
     int announce(ubyte[32] topic, Keypair keyPair, Address[] relays = [], int k = 20,
         Duration per = 2.seconds)
     {
+        auto r = announceWith(topic, keyPair, relays, k, per);
+        announceRelays = r.relays;
+        return r.committed;
+    }
+
+    /// The result of one announce: how many nodes stored the record, and which
+    /// ones (with the address they observed us at) — the relays a client can route
+    /// a handshake through. Per call, so two announce loops interleaving on the
+    /// same node never mix or erase each other's sets.
+    struct AnnounceResult
+    {
+        int committed;
+        AnnounceRelay[] relays;
+    }
+
+    AnnounceResult announceWith(ubyte[32] topic, Keypair keyPair, Address[] relays = [],
+        int k = 20, Duration per = 2.seconds)
+    {
+        AnnounceResult res;
         int committed;
         foreach (q; query(topic, HS_LOOKUP, null, false, k, per))
         {
@@ -205,14 +344,18 @@ final class Dht
             auto val = encodeAnnounce(ann);
             try
             {
-                rpc.request(Address(q.from.host, 4, q.from.port), HS_ANNOUNCE, topic[], val,
+                auto r = rpc.request(Address(q.from.host, 4, q.from.port), HS_ANNOUNCE, topic[], val,
                     q.token, false, per);
+                if (r.error != 0)
+                    continue; // rejected (rate-limited, bad token…): that node holds no route
+                res.relays ~= AnnounceRelay(Address(q.from.host, 4, q.from.port), r.to);
                 committed++;
             }
             catch (Exception)
             {
             }
         }
-        return committed;
+        res.committed = committed;
+        return res;
     }
 }
