@@ -18,10 +18,10 @@
 		"libsodiumd": "~>0.2"
 	},
 	"preBuildCommands": [
-		"bash $PACKAGE_DIR/vendor/build-libudx.sh"
+		"ARCH=host bash $PACKAGE_DIR/vendor/build-libudx.sh"
 	],
-	"lflags": [
-		"bin/libhsudx.a"
+	"sourceFiles": [
+		"bin/udx_amalgam.o"
 	],
 	"libs": [
 		"m",
@@ -261,6 +261,48 @@
 			"importPaths": [
 				"source",
 				"interop/vpn-rendezvous"
+			]
+		},
+		{
+			"name": "udx-pipe",
+			"targetType": "executable",
+			"targetName": "udx-pipe",
+			"mainSourceFile": "interop/udx-pipe/app.d",
+			"sourcePaths": [
+				"source",
+				"interop/udx-pipe"
+			],
+			"importPaths": [
+				"source",
+				"interop/udx-pipe"
+			]
+		},
+		{
+			"name": "dht-pipe",
+			"targetType": "executable",
+			"targetName": "dht-pipe",
+			"mainSourceFile": "interop/dht-pipe/app.d",
+			"sourcePaths": [
+				"source",
+				"interop/dht-pipe"
+			],
+			"importPaths": [
+				"source",
+				"interop/dht-pipe"
+			]
+		},
+		{
+			"name": "hs-pipe",
+			"targetType": "executable",
+			"targetName": "hs-pipe",
+			"mainSourceFile": "interop/hs-pipe/app.d",
+			"sourcePaths": [
+				"source",
+				"interop/hs-pipe"
+			],
+			"importPaths": [
+				"source",
+				"interop/hs-pipe"
 			]
 		}
 	]

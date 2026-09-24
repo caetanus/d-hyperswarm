@@ -19,7 +19,7 @@
 /// UDX stream over the punched hole is wired on top in connect.d (Stage E).
 module hyperswarm.dht.holepuncher;
 
-import core.time : Duration, msecs, seconds;
+import core.time : Duration, MonoTime, msecs, seconds;
 import std.random : uniform;
 
 import vibe.core.core : runTask;
@@ -28,13 +28,45 @@ import hyperswarm.cenc : Address;
 import hyperswarm.dht.rpc : Rpc;
 import hyperswarm.dht.socket_pool : SocketPool;
 import hyperswarm.dht.sleeper : Sleeper;
-import hyperswarm.dht.nat : Nat, sampleNatOn;
+import hyperswarm.dht.nat : Nat, sampleNatInto;
 import hyperswarm.dht.connect_messages : FW_UNKNOWN, FW_OPEN, FW_CONSISTENT, FW_RANDOM;
 
 enum size_t BIRTHDAY_SOCKETS = 256;
 enum int HOLEPUNCH_TTL = 5;
 enum int DEFAULT_TTL = 64;
 enum int MAX_REOPENS = 3;
+
+/// hyperdht's per-DHT random-punch throttle (dht._randomPunches / _lastRandomPunch
+/// / _randomPunchInterval): a birthday spray or a random probe is 256 sockets or
+/// 1750 packets, so at most `limit` of them run at once and `interval` must pass
+/// after one ends before the next starts. A server asked to random-punch while
+/// the gate is busy answers TRY_LATER; a client that would have to random-punch
+/// while it is busy gives up (hyperdht does the same without a relay-through).
+final class RandomPunchGate
+{
+    int punches; /// random punches running now
+    int limit = 1; /// hyperdht: "set to one for extra safety for now"
+    Duration interval = 20.seconds; /// min gap between random punches
+    private MonoTime last; /// when the last random punch ended (init = never)
+
+    bool busy() const nothrow
+    {
+        if (punches >= limit)
+            return true;
+        return last != MonoTime.init && MonoTime.currTime - last < interval;
+    }
+
+    package void begin() nothrow
+    {
+        punches++;
+    }
+
+    package void end() nothrow
+    {
+        last = MonoTime.currTime;
+        punches--;
+    }
+}
 
 /// One address the peer told us to punch, plus whether we've confirmed traffic
 /// from it (a verified address is safe to spray; unverified ones are probed
@@ -65,6 +97,9 @@ final class Holepuncher
     bool connected;
     bool destroyed;
     bool randomized;
+    private RandomPunchGate gate; // shared per DHT; null = unthrottled (tests)
+    private bool punchStarted; // punch() is idempotent: one strategy per puncher
+    private bool punchResult;
 
     /// Fired on the initiator when an inbound beacon proves the hole is open:
     /// (winning socket, peer address the beacon came from).
@@ -104,12 +139,14 @@ final class Holepuncher
         return holders.length;
     }
 
-    this(Rpc rpc, SocketPool pool, bool isInitiator, uint remoteFirewall = FW_UNKNOWN)
+    this(Rpc rpc, SocketPool pool, bool isInitiator, uint remoteFirewall = FW_UNKNOWN,
+        RandomPunchGate gate = null)
     {
         this.rpc = rpc;
         this.pool = pool;
         this.isInitiator = isInitiator;
         this.remoteFirewall = remoteFirewall;
+        this.gate = gate;
         this.sleeper = new Sleeper();
         this.nat = new Nat(true); // firewalled until sampling proves otherwise
         addRef(pool.acquire());
@@ -124,11 +161,36 @@ final class Holepuncher
     /// Learn our own external mapping + NAT verdict by walking the DHT from the holder
     /// socket (hyperdht's nat.autoSample). Sets nat + localFirewall, so the round can
     /// advertise nat.addresses and punch() dispatches on the verdict. Call before punch.
-    void sample(Address[] seeds, Duration timeout = 2.seconds)
+    void sample(Address[] seeds, Duration timeout = 2.seconds, Duration budget = Duration.max)
     {
-        nat = sampleNatOn(rpc, socket(), seeds, /*firewalled*/ true, Nat.minSamples, timeout);
+        // Into the puncher's own Nat, never a swap at the end: a round that runs
+        // while the walk is still on reads the verdict from this same object.
+        // `budget` caps the whole walk (the server samples before its handshake
+        // reply, under the client's request timeout).
+        sampleNatInto(nat, rpc, socket(), seeds, Nat.minSamples, timeout, budget);
         if (nat.firewall != FW_UNKNOWN)
             localFirewall = nat.firewall;
+    }
+
+    /// The DHT-wide random-punch throttle this puncher answers to (null if none).
+    RandomPunchGate randomGate() nothrow
+    {
+        return gate;
+    }
+
+    /// Whether the punch this puncher would run is a random one (a spray or a
+    /// birthday burst) — the kind the gate throttles.
+    bool isRandomPunch() const nothrow
+    {
+        return remoteFirewall >= FW_RANDOM || nat.firewall >= FW_RANDOM;
+    }
+
+    /// Whether this puncher has already committed to a punch (started a strategy).
+    /// A replayed round then re-calls the idempotent punch() rather than being told
+    /// TRY_LATER against the gate slot this very puncher already holds.
+    bool punchInProgress() const nothrow
+    {
+        return punchStarted;
     }
 
     /// Record what the peer told us over the DHT: are they punching, their NAT
@@ -150,6 +212,13 @@ final class Holepuncher
     {
         beacon(socket(), addr, DEFAULT_TTL);
     }
+    /// Open our NAT mapping toward `addr` without the packet reaching it (hyperdht's
+    /// openSession): a low-TTL beacon dies in transit but the mapping it left behind
+    /// is what the peer's first packet needs to find.
+    void openSession(Address addr) nothrow
+    {
+        beacon(socket(), addr, HOLEPUNCH_TTL);
+    }
 
     private bool isVerified(string host) nothrow
     {
@@ -160,8 +229,20 @@ final class Holepuncher
     }
 
     /// Kick off the punch. Picks the strategy from the coerced firewall pair and
-    /// runs it in the background; returns whether a strategy started.
+    /// runs it in the background; returns whether a strategy started. Idempotent
+    /// (hyperdht's `if (!this._punching) this._punching = this._punch()`): every
+    /// later call — a replayed or retried round — returns the first result and
+    /// starts nothing, so one puncher never runs two probe loops over its holders.
     bool punch()
+    {
+        if (punchStarted)
+            return punchResult;
+        punchStarted = true;
+        punchResult = startPunch();
+        return punchResult;
+    }
+
+    private bool startPunch()
     {
         if (done() || remoteAddresses.length == 0)
             return false;
@@ -350,16 +431,25 @@ final class Holepuncher
             destroy();
     }
 
-    // dht._randomPunches rate-limiting is a Stage-E (connect.d) concern; track the
-    // flag locally so destroy() balances it.
+    // hyperdht's _incrementRandomized/_decrementRandomized: a random punch takes
+    // one slot of the DHT-wide gate while it runs, and stamps the gate's clock
+    // when it ends (connected or destroyed) so the next one waits the interval.
     private void incrementRandomized() nothrow
     {
+        if (randomized)
+            return;
         randomized = true;
+        if (gate !is null)
+            gate.begin();
     }
 
     private void decrementRandomized() nothrow
     {
+        if (!randomized)
+            return;
         randomized = false;
+        if (gate !is null)
+            gate.end();
     }
 
     void destroy() nothrow

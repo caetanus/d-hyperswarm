@@ -9,7 +9,11 @@
 module hyperswarm.swarm;
 
 import hyperswarm.dht.node : Dht;
-import hyperswarm.dht.connect : connectHandshake;
+import std.conv : to;
+import hyperswarm.dht.messages : PeerRecord;
+import hyperswarm.dht.connect : connectHandshake, connectHandshakeTo, connectViaHolepunch, ConnectHandshake,
+    PunchResult, PunchOutcome;
+import hyperswarm.dht.connect_messages : FW_OPEN;
 import hyperswarm.dht.serve : Server;
 import hyperswarm.connection : Connection, hsConnRead, hsConnClose, hsConnFinalize;
 import hyperswarm.udx.udx;
@@ -63,10 +67,19 @@ final class Hyperswarm
         return a.host.length ? a : Address("127.0.0.1", 4, dht.rpc.localPort);
     }
 
-    private Connection[string] connections; // by remote pubkey hex (de-dup)
-    private bool[string] connecting; // in-flight connects (de-dup)
+    // Per remote public key, the live connections to it — one PER ADDRESS: a peer
+    // reached on the LAN and through its punched WAN mapping is two connections,
+    // both kept (the application prefers one for new streams and migrates; a
+    // content-addressed transfer resumes on the other with no loss). Identity is
+    // the public key the handshake authenticated, never an address.
+    private Connection[][string] connections;
+    private bool[string] connecting; // in-flight connects: by key hex, or hex@host:port
     private bool[string] topics; // joined topics (hex) still in client mode
     private bool destroyed;
+    // Outbound connections whose stream exists but that are not yet in `connections`
+    // (dialing / waiting to open): close() destroys them before the dht socket, so a
+    // pre-registration stream never leaves the socket busy (UV_EBUSY) at teardown.
+    private bool[Connection] pendingOut;
 
     /// Invoked once per new peer connection, after its secret-stream opens.
     void delegate(Connection) nothrow onConnection;
@@ -95,14 +108,63 @@ final class Hyperswarm
     private void adoptConnection(Connection c) nothrow
     {
         immutable hex = toHex(c.remotePublicKey[]);
-        if ((hex in connections) !is null || (hex in connecting) !is null
-            || connections.length >= maxPeers)
+        // A SYN accepted just before close() opens its secret-stream just after: the
+        // adopt must not put it back in the registry or fire the application handler
+        // once the swarm is torn down.
+        if (destroyed || hasConnectionAt(hex, c.remoteAddress) || liveConnections() >= maxPeers)
         {
-            c.destroy();
+            c.destroy(); // closed; or the same peer at the same address is already ours; or full
             return;
         }
-        connections[hex] = c;
-        c.onClose = () nothrow { connections.remove(hex); };
+        keep(hex, c);
+    }
+
+    /// Every live connection to `pubkey` (LAN, WAN…), for the application to pick
+    /// from. Empty when none.
+    Connection[] connectionsOf(ubyte[32] pubkey) nothrow
+    {
+        if (auto p = toHex(pubkey[]) in connections)
+            return (*p).dup;
+        return null;
+    }
+
+    /// Every live connection, over every key and address — what maxPeers caps
+    /// (a peer reconnecting from fresh source ports is not free).
+    size_t liveConnections() const nothrow
+    {
+        size_t n;
+        foreach (list; connections.byValue)
+            n += list.length;
+        return n;
+    }
+
+    private bool hasConnectionAt(string hex, Address addr) nothrow
+    {
+        if (auto p = hex in connections)
+            foreach (c; *p)
+                if (c.remoteAddress.host == addr.host && c.remoteAddress.port == addr.port)
+                    return true;
+        return false;
+    }
+
+    // Register a connection and announce it; on close, drop exactly that one.
+    private void keep(string hex, Connection c) nothrow
+    {
+        pendingOut.remove(c); // promoted to a live connection
+        connections[hex] ~= c;
+        c.onCloseInternal = () nothrow {
+            if (auto p = hex in connections)
+            {
+                Connection[] rest;
+                foreach (x; *p)
+                    if (x !is c)
+                        rest ~= x;
+                if (rest.length)
+                    connections[hex] = rest;
+                else
+                    connections.remove(hex);
+            }
+        };
         if (onConnection !is null)
             onConnection(c);
     }
@@ -140,11 +202,29 @@ final class Hyperswarm
     void close()
     {
         destroyed = true;
+        // Drain the server's half-open accepts + holepunch sessions first: they hold
+        // streams/pool sockets that would otherwise make the dht socket close return
+        // UV_EBUSY, and their accept tasks would call back into a torn-down swarm.
+        try
+            server.close();
+        catch (Exception)
+        {
+        }
         // Destroy live connections first: libudx refuses to close a socket that
         // still owns streams, so closing the dht socket before this would leak it.
-        foreach (c; connections.values)
-            c.destroy();
+        foreach (list; connections.values)
+            foreach (c; list)
+                c.destroy();
         connections = null;
+        // In-flight outbound streams not yet registered: destroy them too, so no
+        // stream is still on the dht socket when it closes.
+        foreach (c; pendingOut.keys)
+            try
+                c.destroy();
+            catch (Exception)
+            {
+            }
+        pendingOut = null;
         try
             dht.close();
         catch (Exception)
@@ -165,7 +245,13 @@ final class Hyperswarm
             try
             {
                 server.listen(); // announce-self under BLAKE2b(publicKey)
-                dht.announce(topic, keyPair, [ourUdxAddr]); // topic record
+                // The topic record's relayAddresses are the DHT nodes a client can
+                // send our PEER_HANDSHAKE through (the ones the announce-self landed
+                // on, which hold our router entry) — hyperdht's semantics, and what
+                // lets a client skip the FIND_PEER walk. Never our own address: a
+                // NAT'd node cannot be reached there.
+                auto relays = server.relayAddresses(); // this loop's own listen() result
+                dht.announce(topic, keyPair, relays); // topic record
             }
             catch (Exception)
             {
@@ -187,9 +273,8 @@ final class Hyperswarm
         {
             try
             {
-                auto peers = dht.lookup(topic);
-                foreach (p; peers)
-                    handlePeer(p.publicKey);
+                // Connect on the first record the DHT returns; the walk finishes behind.
+                dht.lookupEach(topic, (PeerRecord p) nothrow { handlePeer(p.publicKey, p.relayAddresses); });
             }
             catch (Exception)
             {
@@ -206,33 +291,37 @@ final class Hyperswarm
     }
 
     // De-duplicate by remote pubkey, then connect in a fresh fiber.
-    private void handlePeer(ubyte[32] pubkey) nothrow
+    private void handlePeer(ubyte[32] pubkey, Address[] relayHints = null) nothrow
     {
         if (pubkey[] == keyPair.publicKey[])
             return;
         immutable hex = toHex(pubkey[]);
         if ((hex in connections) !is null || (hex in connecting) !is null)
             return;
-        if (connections.length + connecting.length >= maxPeers)
+        if (liveConnections() + connecting.length >= maxPeers)
             return; // at the connection cap; a later discovery re-offers this peer
         if (onDiscover !is null)
             onDiscover(pubkey);
         connecting[hex] = true;
         auto pk = pubkey;
+        auto hints = relayHints.dup;
         try
-            runTask(() nothrow { connectTo(pk); });
+            runTask(() nothrow { connectTo(pk, hints); });
         catch (Exception)
             connecting.remove(hex);
     }
 
-    private void connectTo(ubyte[32] pubkey) nothrow
+    private void connectTo(ubyte[32] pubkey, Address[] relayHints = null) nothrow
     {
         immutable hex = toHex(pubkey[]);
         scope (exit)
             connecting.remove(hex);
         try
         {
-            auto conn = openConnection(pubkey);
+            auto conn = openConnection(pubkey, relayHints);
+            pendingOut[conn] = true;
+            scope (exit)
+                pendingOut.remove(conn);
             for (int i = 0; i < 300 && !conn.opened; i++)
                 sleep(10.msecs);
             if (!conn.opened)
@@ -240,16 +329,16 @@ final class Hyperswarm
                 conn.destroy(); // gave up: tear the stream down, don't leak it
                 return;
             }
-            if ((hex in connections) !is null)
+            // Dedup by the ADDRESS we actually reached, not the key: a WAN dial that
+            // completes while a LAN path to the same peer is already up is a second,
+            // wanted connection (roaming), kept unless THIS exact endpoint is already
+            // ours. And never adopt into a swarm that has since closed.
+            if (destroyed || hasConnectionAt(hex, conn.remoteAddress))
             {
-                conn.destroy(); // an inbound connection to this peer won the race
+                conn.destroy();
                 return;
             }
-            connections[hex] = conn;
-            // On close, free the slot so a later discovery can reconnect this peer.
-            conn.onClose = () nothrow { connections.remove(hex); };
-            if (onConnection !is null)
-                onConnection(conn);
+            keep(hex, conn);
         }
         catch (Exception)
         {
@@ -258,10 +347,123 @@ final class Hyperswarm
 
     // The full client connect: peer handshake, open a UDX stream to the server on
     // our shared socket, and run the connection secret-stream from the IK keys.
-    private Connection openConnection(ubyte[32] pubkey)
+    /// The udx/dht socket's local port — what a LAN beacon announces so a peer on
+    /// the same network can connectAt() us without any DHT round trip.
+    ushort udxPort()
     {
+        return dht.rpc.localPort;
+    }
+
+    /// Connect to `pubkey` at a KNOWN address (a LAN peer found by mDNS): the peer
+    /// handshake goes straight to `addr` — no lookup, no relay, no punch — and the
+    /// udx stream is opened to that same address, not to whatever public address the
+    /// server advertises (from the LAN, its public address is the wrong side of its
+    /// NAT). Fires onConnection like a DHT-found peer; de-duplicated the same way.
+    void connectAt(ubyte[32] pubkey, Address addr) nothrow
+    {
+        if (destroyed || pubkey[] == keyPair.publicKey[])
+            return;
+        immutable hex = toHex(pubkey[]);
+        immutable key = hex ~ "@" ~ addr.host ~ ":" ~ to!string(addr.port);
+        // Another connection to this peer at ANOTHER address is no reason to skip:
+        // a LAN path found while the WAN one still lives is opened right away and
+        // both stay up (roaming). Only the same address, or a dial to it in flight.
+        if (hasConnectionAt(hex, addr) || (key in connecting) !is null)
+        {
+            import vibe.core.log : logInfo;
+            logInfo("hyperswarm: connectAt %s:%s skipped (%s)", addr.host, addr.port,
+                hasConnectionAt(hex, addr) ? "already connected at this address" : "connect to it in flight");
+            return;
+        }
+        if (liveConnections() + connecting.length >= maxPeers)
+            return; // the cap counts connections, not keys: a second path is not free
+        if (onDiscover !is null && hex !in connections)
+            onDiscover(pubkey);
+        connecting[key] = true;
+        auto pk = pubkey;
+        try
+            runTask(() nothrow {
+                scope (exit)
+                    connecting.remove(key);
+                try
+                {
+                    immutable uint ourUdxId = cast(uint) uniform(1, uint.max);
+                    auto ch = connectHandshakeTo(dht, pk, keyPair, addr, ourUdxAddr, ourUdxId);
+                    auto conn = openStreamTo(ch, addr, ourUdxId);
+                    pendingOut[conn] = true;
+                    scope (exit)
+                        pendingOut.remove(conn);
+                    adoptOutbound(hex, conn);
+                }
+                catch (Exception e)
+                {
+                    import vibe.core.log : logInfo;
+                    logInfo("hyperswarm: connectAt %s:%s failed: %s", addr.host, addr.port, e.msg);
+                }
+            });
+        catch (Exception)
+            connecting.remove(key);
+    }
+
+    // The udx stream + secret-stream over a completed handshake, aimed at `target`.
+    private Connection openStreamTo(ConnectHandshake ch, Address target, uint ourUdxId)
+    {
+        auto stream = new ubyte[](hs_udx_sizeof_stream());
+        hs_udx_stream_init(dht.rpc.udxPtr, stream.ptr, ourUdxId, &hsConnClose, &hsConnFinalize);
+        hs_udx_stream_read_start(stream.ptr, &hsConnRead);
+        auto ss = SecretStream.fromHandshake(true, ch.hs.tx, ch.hs.rx, ch.hs.hash,
+            ch.hs.remotePublicKey);
+        auto conn = new Connection(dht.rpc.udxPtr, stream.ptr, ss, ch.hs.remotePublicKey);
+        conn.remoteAddress = target;
+        sockaddr_in peer;
+        peer.sin_family = AF_INET;
+        peer.sin_addr.s_addr = inet_addr(target.host.toStringz);
+        peer.sin_port = htons(target.port);
+        hs_udx_stream_connect(stream.ptr, dht.rpc.sockPtr, ch.serverPayload.udx.id, cast(sockaddr*)&peer);
+        conn.start(); // secret-stream setup frame
+        return conn;
+    }
+
+    // Wait for the secret-stream to open, then register + announce, unless a
+    // connection to the same peer at the same address won meanwhile.
+    private void adoptOutbound(string hex, Connection conn)
+    {
+        for (int i = 0; i < 300 && !conn.opened; i++)
+            sleep(10.msecs);
+        if (!conn.opened)
+        {
+            conn.destroy(); // gave up: tear the stream down, don't leak it
+            return;
+        }
+        if (destroyed || hasConnectionAt(hex, conn.remoteAddress))
+        {
+            conn.destroy(); // closed meanwhile, or an inbound over this path won the race
+            return;
+        }
+        keep(hex, conn);
+    }
+
+    private Connection openConnection(ubyte[32] pubkey, Address[] relayHints = null)
+    {
+        // A NAT'd peer (CGNAT/4G — the whole point) can't be reached by a direct dial,
+        // so the ONE handshake advertises our firewall as unknown: if the server offers
+        // a holepunch, connectViaHolepunch runs it and returns the connection over the
+        // punched socket; if it offers none it is directly reachable and we dial it
+        // from that same handshake. A punch that was tried and failed is a failure —
+        // never a second handshake claiming we are OPEN when we are not.
         immutable uint ourUdxId = cast(uint) uniform(1, uint.max);
-        auto ch = connectHandshake(dht, pubkey, keyPair, ourUdxAddr, ourUdxId);
+        auto r = connectViaHolepunch(dht, pubkey, keyPair, ourUdxAddr, ourUdxId,
+            3.seconds, 30.seconds, relayHints);
+        final switch (r.outcome)
+        {
+        case PunchOutcome.punched:
+            return r.conn;
+        case PunchOutcome.failed:
+            throw new Exception("hyperswarm: holepunch failed");
+        case PunchOutcome.direct:
+            break;
+        }
+        auto ch = r.handshake;
 
         auto stream = new ubyte[](hs_udx_sizeof_stream());
         hs_udx_stream_init(dht.rpc.udxPtr, stream.ptr, ourUdxId, &hsConnClose, &hsConnFinalize);
@@ -276,6 +478,7 @@ final class Hyperswarm
         // relayed case serverAddress is the relay node, not the server.
         auto target = ch.serverPayload.addresses4.length ? ch.serverPayload.addresses4[0]
             : ch.serverAddress;
+        conn.remoteAddress = target;
         sockaddr_in peer;
         peer.sin_family = AF_INET;
         peer.sin_addr.s_addr = inet_addr(target.host.toStringz);

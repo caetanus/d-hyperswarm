@@ -192,9 +192,25 @@ Nat sampleNat(Rpc rpc, SocketPool pool, Address[] seeds, bool firewalled,
 Nat sampleNatOn(Rpc rpc, void* sock, Address[] seeds, bool firewalled,
     size_t maxPings = Nat.minSamples, Duration timeout = 2.seconds)
 {
-    import std.random : uniform;
-
     auto nat = new Nat(firewalled);
+    sampleNatInto(nat, rpc, sock, seeds, maxPings, timeout);
+    return nat;
+}
+
+/// The walk of sampleNatOn feeding an EXISTING Nat, sample by sample: the caller
+/// (the holepuncher) reads the verdict from the same object the walk fills, so a
+/// round that runs while the walk is still going sees what has been learnt so far
+/// rather than a stale object swapped in at the end. Cancellation-aware: an
+/// interrupt of the calling task cancels every ping still in flight and joins it
+/// before rethrowing, and the normal return joins too — no fiber of this walk
+/// outlives the call, so the socket can be released right after.
+void sampleNatInto(Nat nat, Rpc rpc, void* sock, Address[] seeds,
+    size_t maxPings = Nat.minSamples, Duration timeout = 2.seconds, Duration budget = Duration.max)
+{
+    import std.random : uniform;
+    import vibe.core.core : Task;
+    import core.time : MonoTime, msecs;
+    immutable deadline = budget == Duration.max ? MonoTime.max : MonoTime.currTime + budget;
 
     // FIND_NODE toward a fixed random target: its reply carries our observed `to`
     // (the NAT sample, independent of the command) AND closerNodes to walk, so the
@@ -203,27 +219,96 @@ Nat sampleNatOn(Rpc rpc, void* sock, Address[] seeds, bool firewalled,
     foreach (ref b; target)
         b = cast(ubyte) uniform(0, 256);
 
+    // The pings go out in waves, all of a wave at once: the sample is bound by one
+    // round trip per wave, not by the sum of them (and of the timeouts of the nodes
+    // that never answer). Serial, this took 1.5 s of the time to connect.
+    import vibe.core.core : runTask;
+    import vibe.core.sync : createManualEvent;
     Address[] queue = seeds.dup;
     bool[string] pinged;
-    size_t sent;
-    while (queue.length > 0 && sent < maxPings && !nat.analyzed)
+    size_t sent, inFlight;
+    auto changed = createManualEvent();
+    Task[] tasks; // every ping launched, so they can be cancelled and joined
+    // Cancel what is still in flight and wait for it: a ping parked in its reply
+    // wait throws out on interrupt, drops its pending entry and signals `changed`.
+    void settle() nothrow
     {
-        immutable node = queue[0];
-        queue = queue[1 .. $];
-        immutable key = format("%s:%d", node.host, node.port);
-        if (key in pinged)
-            continue;
-        pinged[key] = true;
-        try
+        foreach (t; tasks)
+            if (t.running)
+                try
+                    t.interrupt();
+                catch (Exception)
+                {
+                }
+        while (inFlight > 0)
         {
-            auto reply = rpc.request(node, FIND_NODE, target[], null, null, true, timeout, sock);
-            nat.add(reply.to, node); // reply.to = our external as this node saw us
-            sent++;
-            queue ~= reply.closerNodes;
+            try
+            {
+                auto ec = changed.emitCount;
+                changed.wait(ec);
+            }
+            catch (Exception)
+            {
+                // interrupted while joining: keep joining — the children are already
+                // cancelled and finish on their own
+            }
         }
-        catch (Exception)
-        {
-        } // unreachable node — try the next
     }
-    return nat;
+    scope (exit)
+        settle(); // the normal return and an interrupt both leave nothing running
+    while (queue.length > 0 && sent < maxPings && !nat.analyzed && MonoTime.currTime < deadline)
+    {
+        Address[] wave;
+        while (queue.length > 0 && wave.length + sent < maxPings)
+        {
+            immutable node = queue[0];
+            queue = queue[1 .. $];
+            immutable key = format("%s:%d", node.host, node.port);
+            if (key in pinged)
+                continue;
+            pinged[key] = true;
+            wave ~= node;
+        }
+        if (wave.length == 0)
+            break;
+        Address[] closer;
+        foreach (node; wave)
+        {
+            inFlight++;
+            try
+            tasks ~= runTask((Address n) nothrow {
+                scope (exit)
+                    inFlight--;
+                scope (exit)
+                    changed.emit();
+                try
+                {
+                    // Cap each request by what remains of the overall budget, so a
+                    // wave launched just under the deadline cannot run a whole extra
+                    // timeout past it (the server samples under the client's deadline).
+                    auto reqTimeout = timeout;
+                    if (deadline != MonoTime.max)
+                    {
+                        auto rem = deadline - MonoTime.currTime;
+                        reqTimeout = rem < timeout ? (rem < 1.msecs ? 1.msecs : rem) : timeout;
+                    }
+                    auto reply = rpc.request(n, FIND_NODE, target[], null, null, true, reqTimeout, sock);
+                    nat.add(reply.to, n); // reply.to = our external as this node saw us
+                    sent++;
+                    closer ~= reply.closerNodes;
+                }
+                catch (Exception)
+                {
+                } // unreachable node — the others of the wave still count
+            }, node);
+            catch (Exception)
+                inFlight--; // the child never started: do not wait for it
+        }
+        while (inFlight > 0 && !nat.analyzed)
+        {
+            auto ec = changed.emitCount;
+            changed.wait(ec); // an interrupt propagates: scope(exit) settles the wave
+        }
+        queue ~= closer;
+    }
 }

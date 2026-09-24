@@ -68,7 +68,7 @@ unittest
             g_poolSnapshot = pool.count();
 
             hp.destroy();
-            sleep(10.msecs);
+            sleep(50.msecs); // udx closes asynchronously; the loop runs the close cbs
             g_poolAfterDestroy = pool.count();
         }
         catch (Exception)
@@ -178,4 +178,58 @@ unittest
     g_rpBadHost.should.equal(false); // every probe to the peer host
     g_rpBadRange.should.equal(false); // ports >= 1000 (< 65536 by type)
     g_rpPortVaried.should.equal(true); // ports are randomised, not fixed
+}
+
+
+// punch() is idempotent (hyperdht memoises the punch promise): a replayed or
+// retried round calling it again must not start a second probe loop over the
+// same holders. CONSISTENT x CONSISTENT fires exactly two beacons up front (the
+// fast-open ping + the first tick), so two punch() calls that started two loops
+// would show four.
+private __gshared size_t g_idemBeacons;
+private __gshared bool g_idemFirst, g_idemSecond;
+
+@("holepuncher: punch() twice starts one strategy (idempotent)")
+unittest
+{
+    g_idemBeacons = 0;
+    g_idemFirst = g_idemSecond = false;
+
+    runTask(() nothrow {
+        Rpc rpc;
+        try
+        {
+            rpc = new Rpc(0);
+            auto pool = new SocketPool(rpc);
+            auto hp = new Holepuncher(rpc, pool, /*isInitiator*/ true, FW_CONSISTENT);
+            hp.localFirewall = FW_CONSISTENT;
+            hp.onBeaconSent = (void* sock, Address to, int ttl) nothrow { g_idemBeacons++; };
+            hp.updateRemote(true, FW_CONSISTENT, [Address("5.6.7.8", 4, 9000)], "5.6.7.8");
+            g_idemFirst = hp.punch();
+            g_idemSecond = hp.punch();
+            sleep(20.msecs); // both loops (if two) would have fired their first beacons
+            hp.destroy();
+        }
+        catch (Exception)
+        {
+        }
+        try
+        {
+            if (rpc !is null)
+                rpc.close();
+        }
+        catch (Exception)
+        {
+        }
+        try
+            exitEventLoop();
+        catch (Exception)
+        {
+        }
+    });
+    runEventLoop();
+
+    g_idemFirst.should.equal(true);
+    g_idemSecond.should.equal(true); // the memoised result, not a second start
+    g_idemBeacons.should.equal(cast(size_t) 2); // one loop's worth, not two
 }

@@ -16,10 +16,10 @@ import core.time : Duration, seconds;
 import hyperswarm.cenc : Address;
 import hyperswarm.dht.rpc : Rpc;
 import hyperswarm.dht.socket_pool : SocketPool;
-import hyperswarm.dht.holepuncher : Holepuncher;
+import hyperswarm.dht.holepuncher : Holepuncher, RandomPunchGate;
 import hyperswarm.dht.secure_payload : SecurePayload;
 import hyperswarm.dht.connect_messages : Holepunch, HolepunchPayload,
-    FW_UNKNOWN, FW_OPEN, FW_CONSISTENT, ERR_NONE, ERR_ABORTED;
+    FW_UNKNOWN, FW_OPEN, FW_CONSISTENT, ERR_NONE, ERR_ABORTED, ERR_TRY_LATER;
 
 final class HolepunchSession
 {
@@ -29,9 +29,9 @@ final class HolepunchSession
     bool destroyed;
 
     this(Rpc rpc, SocketPool pool, ubyte[32] holepunchSecret, bool isInitiator,
-        uint remoteFirewall = FW_UNKNOWN)
+        uint remoteFirewall = FW_UNKNOWN, RandomPunchGate gate = null)
     {
-        puncher = new Holepuncher(rpc, pool, isInitiator, remoteFirewall);
+        puncher = new Holepuncher(rpc, pool, isInitiator, remoteFirewall, gate);
         payload = new SecurePayload(holepunchSecret);
     }
 
@@ -46,9 +46,9 @@ final class HolepunchSession
 
     /// Sample our own external mapping + NAT verdict off the DHT before the round
     /// (server does this when it registers the session; client after the handshake).
-    void sample(Address[] seeds, Duration timeout = 2.seconds)
+    void sample(Address[] seeds, Duration timeout = 2.seconds, Duration budget = Duration.max)
     {
-        puncher.sample(seeds, timeout);
+        puncher.sample(seeds, timeout, budget);
     }
 
     /// Process one inbound PEER_HOLEPUNCH round and return the sealed reply payload
@@ -90,15 +90,39 @@ final class HolepunchSession
                 echoed ? peerAddress.host : null);
         }
 
+        // Open our NAT mapping toward the peer's punch socket NOW, from the round it
+        // announced it in: a low-TTL beacon that dies in transit but leaves the
+        // mapping behind. The peer starts beaconing us as soon as it has our reply;
+        // behind a conntrack NAT (Docker, most home routers) the first inbound packet
+        // to a port we have not yet sent from books that tuple, and our own later
+        // send gets a fresh port — the hole misses. Being first costs one packet.
+        p.openSession(peerAddress);
         // Fast mode: if we're consistent and the peer opened a session to the address
-        // we advertise, fire a quick beacon back to pin our outbound (the same
-        // fast-open ping that fixed the rig's second-mover fork).
+        // we advertise, fire a real beacon back too (hyperdht's fast-open ping).
         if (coerce(p.nat.firewall) == FW_CONSISTENT && remote.hasRemoteAddress
             && addrIn(p.nat.addresses, remote.remoteAddress))
             p.ping(peerAddress);
 
         if (p.remoteHolepunching)
-            p.punch();
+        {
+            // server.js: a random punch while the DHT-wide gate is busy is answered
+            // TRY_LATER — as an abort, since there is no relay-through to retry over.
+            auto gate = p.randomGate();
+            // Only a NEW random punch is throttled: if THIS puncher already holds the
+            // gate slot (a replayed/duplicate round), re-run its memoized punch()
+            // instead of aborting it against its own reservation.
+            if (p.isRandomPunch() && !p.punchInProgress() && gate !is null && gate.busy())
+                return abort(ERR_TRY_LATER);
+            immutable started = p.punch();
+            if (p.destroyed)
+                return Nullable!(ubyte[]).init;
+            // Abort only when we actually had a verdict and still could not punch
+            // (genuinely unpunchable). Before our own NAT sample lands (firewall
+            // UNKNOWN) a round cannot pick a strategy yet — seal a normal reply and
+            // let a later round drive the punch once sampling has a verdict.
+            if (!started && p.nat.firewall != FW_UNKNOWN)
+                return abort();
+        }
 
         if (p.nat.firewall != FW_UNKNOWN)
             p.nat.freeze(); // freeze the verdict we're handing the peer
@@ -121,7 +145,11 @@ final class HolepunchSession
     /// `remoteAddress` = where we currently think the server is (its advertised addr).
     /// `punching` announces we're about to punch (probe rounds send false to exchange
     /// NAT state first; the punch round sends true so the server punches with us).
-    ubyte[] buildClientRound(Address remoteAddress, bool punching = false)
+    /// `token` = our token for the server's address (the punch round; null in a
+    /// probe), `remoteToken` = the token the server minted for us in its last reply,
+    /// echoed back so it can verify our address.
+    ubyte[] buildClientRound(Address remoteAddress, bool punching = false,
+        ubyte[] token = null, ubyte[] remoteToken = null)
     {
         HolepunchPayload m;
         m.error = ERR_NONE;
@@ -132,7 +160,18 @@ final class HolepunchSession
         m.addresses = puncher.nat.addresses;
         m.hasRemoteAddress = remoteAddress.host.length != 0;
         m.remoteAddress = remoteAddress;
+        m.token = token;
+        m.remoteToken = remoteToken;
         return payload.encrypt(m);
+    }
+
+    /// What the client learns from one round reply.
+    struct RoundReply
+    {
+        bool ok; /// decrypted and error-free
+        uint error;
+        ubyte[] token; /// the server's token for our address (echo it next round)
+        bool tryLater;
     }
 
     /// Client side, incoming half of one round: process the server's sealed reply.
@@ -141,18 +180,34 @@ final class HolepunchSession
     /// the server's firewall + addresses (verified-address / token-echo deferred, so
     /// the peer addresses are probed rather than sprayed — fine for the CONSISTENT
     /// path). Call puncher.punch() after, once both sides know each other.
-    bool applyReply(scope const(ubyte)[] sealed, Address replyTo, Address replyFrom)
+    /// `sentToken` = the token we put in the request (punch round), `peerHost` = the
+    /// server address we sent it for: when the server echoes it back the address is
+    /// verified (hyperdht updateHolepunch).
+    RoundReply applyReply(scope const(ubyte)[] sealed, Address replyTo, Address replyFrom,
+        ubyte[] sentToken = null, string peerHost = null)
     {
+        RoundReply r;
         auto rpn = payload.decrypt(sealed);
         if (rpn.isNull)
-            return false;
+            return r;
         auto remote = rpn.get;
+        r.error = remote.error;
+        if (remote.error == ERR_TRY_LATER)
+        {
+            r.tryLater = true;
+            return r;
+        }
         if (remote.error != ERR_NONE)
-            return false;
+            return r;
         auto p = puncher;
         p.nat.add(replyTo, replyFrom); // our external as the relay observed us
-        p.updateRemote(remote.punching, remote.firewall, remote.addresses, null);
-        return true;
+        immutable echoed = sentToken.length && remote.remoteToken.length
+            && remote.remoteToken == sentToken;
+        p.updateRemote(remote.punching, remote.firewall, remote.addresses,
+            echoed ? peerHost : null);
+        r.token = remote.token;
+        r.ok = true;
+        return r;
     }
 
     /// Seal an abort reply and tear the puncher down.

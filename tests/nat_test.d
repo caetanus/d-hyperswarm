@@ -84,3 +84,70 @@ unittest
     n.add(to("5.5.5.5", 100), peer(1));
     n.sampled.should.equal(cast(size_t) 1); // only one distinct responder counted
 }
+
+
+// The sampler's pings are fibers of their own; interrupting the walk must cancel
+// and join them (nothing may keep using the holder socket after the walk
+// returns), and must not wait out the 2 s request timeout to do so.
+private __gshared bool g_nsDone;
+private __gshared long g_nsMs;
+
+@("nat: interrupting sampleNatInto cancels its in-flight pings promptly")
+unittest
+{
+    import core.time : MonoTime, msecs, seconds;
+    import vibe.core.core : runTask, runEventLoop, exitEventLoop, sleep;
+    import hyperswarm.dht.rpc : Rpc;
+    import hyperswarm.dht.socket_pool : SocketPool;
+    import hyperswarm.dht.nat : sampleNatInto;
+
+    g_nsDone = false;
+    g_nsMs = -1;
+
+    runTask(() nothrow {
+        Rpc rpc;
+        try
+        {
+            rpc = new Rpc(0);
+            auto pool = new SocketPool(rpc);
+            auto sock = pool.acquire();
+            auto nat = new Nat(true);
+            // nobody answers on 127.0.0.1:9 — every ping would wait its full timeout
+            auto seeds = [Address("127.0.0.1", 4, 9), Address("127.0.0.1", 4, 10)];
+            auto sampler = runTask(() nothrow {
+                try
+                    sampleNatInto(nat, rpc, sock, seeds, 4, 2.seconds);
+                catch (Exception)
+                {
+                }
+                g_nsDone = true;
+            });
+            sleep(50.msecs);
+            immutable t0 = MonoTime.currTime;
+            sampler.interrupt();
+            sampler.join();
+            g_nsMs = (MonoTime.currTime - t0).total!"msecs";
+            pool.release(sock);
+        }
+        catch (Exception)
+        {
+        }
+        try
+        {
+            if (rpc !is null)
+                rpc.close();
+        }
+        catch (Exception)
+        {
+        }
+        try
+            exitEventLoop();
+        catch (Exception)
+        {
+        }
+    });
+    runEventLoop();
+
+    g_nsDone.should.equal(true); // the walk returned (children joined)...
+    g_nsMs.should.be.lessThan(500L); // ...without waiting out the pings' timeout
+}

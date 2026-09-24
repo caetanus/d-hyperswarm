@@ -37,10 +37,10 @@ serve.d: no reachable remoteAddress→advertise firewall=UNKNOWN + holepunch{id,
 node/rpc: Rpc.request(socket=main)+g_rpcBySock reg; SocketPool on Dht (acquire/release, N sockets on rpc.udxPtr, 1-byte demux, 3s linger). Relay role (router.d) deferrable — live DHT nodes relay for client/server interop.
 
 ## UDX BLOCKERS (bind in amalgam + udx.d)
-1. hs_udx_socket_send_ttl(req,s,bufs,len,addr,ttl,cb) — udx_socket_send_ttl (udx.h:599). REQUIRED (beacon). facade already has hsuv_udp_set_ttl (facade.d:668).
+1. hs_udx_socket_send_ttl(req,s,bufs,len,addr,ttl,cb) — udx_socket_send_ttl (udx.h:599). REQUIRED (beacon). facade already has __d_hsuv_udp_set_ttl (facade.d:668).
 2. hs_udx_stream_change_remote(stream,socket,remote_id,addr,cb) + alias UdxStreamRemoteChangedCb=extern(C) void function(void*) nothrow — udx_stream_change_remote (udx.h:647). REQUIRED (onsocket upgrade).
 3. hs_udx_stream_relay_to — udx.h:650. ONLY for relay role (deferrable).
-Present: hs_udx_stream_firewall (accept), hsuv_udp_set_ttl.
+Present: hs_udx_stream_firewall (accept), __d_hsuv_udp_set_ttl.
 
 ## Staging (each independently testable)
 A. udx bindings (send_ttl + change_remote) — unit, no network.

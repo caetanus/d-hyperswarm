@@ -30,43 +30,43 @@ extern "C" {
 // The facade FUNCTIONS are the only symbols that could clash with a real libuv if
 // one is ever linked into the same binary (the udx_* symbols are unique to libudx;
 // the uv types and UV_E* codes are compile-time only and emit no symbols). We prefix
-// the function names to hsuv_* so the facade exposes no global uv_* symbol. The
+// the function names to __d_hsuv_* so the facade exposes no global uv_* symbol. The
 // preprocessor rewrites whole tokens, so both these declarations and libudx's own
-// calls become hsuv_*; our D implementation exports hsuv_*. libudx's source is
+// calls become __d_hsuv_*; our D implementation exports __d_hsuv_*. libudx's source is
 // untouched. (uv_close_cb etc. are distinct tokens and are NOT affected.)
-#define uv_now                          hsuv_now
-#define uv_hrtime                       hsuv_hrtime
-#define uv_buf_init                     hsuv_buf_init
-#define uv_close                        hsuv_close
-#define uv_is_active                    hsuv_is_active
-#define uv_fileno                       hsuv_fileno
-#define uv_recv_buffer_size             hsuv_recv_buffer_size
-#define uv_send_buffer_size             hsuv_send_buffer_size
-#define uv_udp_init                     hsuv_udp_init
-#define uv_udp_bind                     hsuv_udp_bind
-#define uv_udp_recv_start               hsuv_udp_recv_start
-#define uv_udp_getsockname              hsuv_udp_getsockname
-#define uv_udp_send                     hsuv_udp_send
-#define uv_udp_try_send                 hsuv_udp_try_send
-#define uv_udp_set_ttl                  hsuv_udp_set_ttl
-#define uv_udp_set_multicast_loop       hsuv_udp_set_multicast_loop
-#define uv_udp_set_multicast_interface  hsuv_udp_set_multicast_interface
-#define uv_udp_set_membership           hsuv_udp_set_membership
-#define uv_udp_set_source_membership    hsuv_udp_set_source_membership
-#define uv_timer_init                   hsuv_timer_init
-#define uv_timer_start                  hsuv_timer_start
-#define uv_timer_stop                   hsuv_timer_stop
-#define uv_prepare_init                 hsuv_prepare_init
-#define uv_prepare_start                hsuv_prepare_start
-#define uv_prepare_stop                 hsuv_prepare_stop
-#define uv_check_init                   hsuv_check_init
-#define uv_check_start                  hsuv_check_start
-#define uv_check_stop                   hsuv_check_stop
-#define uv_getaddrinfo                  hsuv_getaddrinfo
-#define uv_freeaddrinfo                 hsuv_freeaddrinfo
-#define uv_interface_addresses          hsuv_interface_addresses
-#define uv_free_interface_addresses     hsuv_free_interface_addresses
-#define uv_strerror                     hsuv_strerror
+#define uv_now                          __d_hsuv_now
+#define uv_hrtime                       __d_hsuv_hrtime
+#define uv_buf_init                     __d_hsuv_buf_init
+#define uv_close                        __d_hsuv_close
+#define uv_is_active                    __d_hsuv_is_active
+#define uv_fileno                       __d_hsuv_fileno
+#define uv_recv_buffer_size             __d_hsuv_recv_buffer_size
+#define uv_send_buffer_size             __d_hsuv_send_buffer_size
+#define uv_udp_init                     __d_hsuv_udp_init
+#define uv_udp_bind                     __d_hsuv_udp_bind
+#define uv_udp_recv_start               __d_hsuv_udp_recv_start
+#define uv_udp_getsockname              __d_hsuv_udp_getsockname
+#define uv_udp_send                     __d_hsuv_udp_send
+#define uv_udp_try_send                 __d_hsuv_udp_try_send
+#define uv_udp_set_ttl                  __d_hsuv_udp_set_ttl
+#define uv_udp_set_multicast_loop       __d_hsuv_udp_set_multicast_loop
+#define uv_udp_set_multicast_interface  __d_hsuv_udp_set_multicast_interface
+#define uv_udp_set_membership           __d_hsuv_udp_set_membership
+#define uv_udp_set_source_membership    __d_hsuv_udp_set_source_membership
+#define uv_timer_init                   __d_hsuv_timer_init
+#define uv_timer_start                  __d_hsuv_timer_start
+#define uv_timer_stop                   __d_hsuv_timer_stop
+#define uv_prepare_init                 __d_hsuv_prepare_init
+#define uv_prepare_start                __d_hsuv_prepare_start
+#define uv_prepare_stop                 __d_hsuv_prepare_stop
+#define uv_check_init                   __d_hsuv_check_init
+#define uv_check_start                  __d_hsuv_check_start
+#define uv_check_stop                   __d_hsuv_check_stop
+#define uv_getaddrinfo                  __d_hsuv_getaddrinfo
+#define uv_freeaddrinfo                 __d_hsuv_freeaddrinfo
+#define uv_interface_addresses          __d_hsuv_interface_addresses
+#define uv_free_interface_addresses     __d_hsuv_free_interface_addresses
+#define uv_strerror                     __d_hsuv_strerror
 
 // ── error codes ──────────────────────────────────────────────────────────────
 // libuv's convention on Unix: negative errno, with UV_EOF a sentinel. libudx only
@@ -177,53 +177,71 @@ struct uv_interface_address_s {
     struct sockaddr_in6 netmask6;
   } netmask;
 };
+#ifdef __cplusplus
+}  // extern "C" — the types above are compile-time only; nothing to mangle
+#endif
 
 // ── the API libudx calls (31 functions) ─────────────────────────────────────
-uint64_t uv_now(const uv_loop_t *loop);
+// SYMBOL ISOLATION, part 2: these are the only facade symbols. In the C++
+// amalgamation they are declared inside `namespace HSUV_NAMESPACE` (= udx) with
+// C++ linkage, so NO global uv_*/__d_hsuv_* symbol exists — the D facade implements
+// them as extern(C++, "udx"). Parameters are deliberately `void*`-typed (handles,
+// loop, req, addr, callbacks): the D side declares them as void* too, so the C++
+// mangled names carry only void*/int/unsigned/uint64_t/char* and match trivially.
+// libudx's typed arguments convert implicitly (T* -> void*; fn-ptr -> void* is a
+// g++ extension, and the amalgam already builds with -fpermissive). libudx's
+// source is untouched — the uv_* -> __d_hsuv_* #defines above rewrite its calls.
+#if defined(__cplusplus) && defined(HSUV_NAMESPACE)
+namespace HSUV_NAMESPACE {
+#elif defined(__cplusplus)
+extern "C" {
+#endif
+
+uint64_t uv_now(const void *loop);
 uint64_t uv_hrtime(void);
 
 uv_buf_t uv_buf_init(char *base, unsigned int len);
 
-void uv_close(uv_handle_t *handle, uv_close_cb close_cb);
-int uv_is_active(const uv_handle_t *handle);
-int uv_fileno(const uv_handle_t *handle, uv_os_fd_t *fd);
-int uv_recv_buffer_size(uv_handle_t *handle, int *value);
-int uv_send_buffer_size(uv_handle_t *handle, int *value);
+void uv_close(void *handle, void *close_cb);
+int uv_is_active(const void *handle);
+int uv_fileno(const void *handle, int *fd);
+int uv_recv_buffer_size(void *handle, int *value);
+int uv_send_buffer_size(void *handle, int *value);
 
-int uv_udp_init(uv_loop_t *loop, uv_udp_t *handle);
-int uv_udp_bind(uv_udp_t *handle, const struct sockaddr *addr, unsigned int flags);
-int uv_udp_recv_start(uv_udp_t *handle, uv_alloc_cb alloc_cb, uv_udp_recv_cb recv_cb);
-int uv_udp_getsockname(const uv_udp_t *handle, struct sockaddr *name, int *namelen);
-int uv_udp_send(uv_udp_send_t *req, uv_udp_t *handle, const uv_buf_t bufs[], unsigned int nbufs, const struct sockaddr *addr, uv_udp_send_cb send_cb);
-int uv_udp_try_send(uv_udp_t *handle, const uv_buf_t bufs[], unsigned int nbufs, const struct sockaddr *addr);
-int uv_udp_set_ttl(uv_udp_t *handle, int ttl);
-int uv_udp_set_multicast_loop(uv_udp_t *handle, int on);
-int uv_udp_set_multicast_interface(uv_udp_t *handle, const char *interface_addr);
-int uv_udp_set_membership(uv_udp_t *handle, const char *multicast_addr, const char *interface_addr, uv_membership membership);
-int uv_udp_set_source_membership(uv_udp_t *handle, const char *multicast_addr, const char *interface_addr, const char *source_addr, uv_membership membership);
+int uv_udp_init(void *loop, void *handle);
+int uv_udp_bind(void *handle, const void *addr, unsigned int flags);
+int uv_udp_recv_start(void *handle, void *alloc_cb, void *recv_cb);
+int uv_udp_getsockname(const void *handle, void *name, int *namelen);
+int uv_udp_send(void *req, void *handle, const void *bufs, unsigned int nbufs, const void *addr, void *send_cb);
+int uv_udp_try_send(void *handle, const void *bufs, unsigned int nbufs, const void *addr);
+int uv_udp_set_ttl(void *handle, int ttl);
+int uv_udp_set_multicast_loop(void *handle, int on);
+int uv_udp_set_multicast_interface(void *handle, const char *interface_addr);
+int uv_udp_set_membership(void *handle, const char *multicast_addr, const char *interface_addr, int membership);
+int uv_udp_set_source_membership(void *handle, const char *multicast_addr, const char *interface_addr, const char *source_addr, int membership);
 
-int uv_timer_init(uv_loop_t *loop, uv_timer_t *handle);
-int uv_timer_start(uv_timer_t *handle, uv_timer_cb cb, uint64_t timeout, uint64_t repeat);
-int uv_timer_stop(uv_timer_t *handle);
+int uv_timer_init(void *loop, void *handle);
+int uv_timer_start(void *handle, void *cb, uint64_t timeout, uint64_t repeat);
+int uv_timer_stop(void *handle);
 
-int uv_prepare_init(uv_loop_t *loop, uv_prepare_t *prepare);
-int uv_prepare_start(uv_prepare_t *prepare, uv_prepare_cb cb);
-int uv_prepare_stop(uv_prepare_t *prepare);
+int uv_prepare_init(void *loop, void *prepare);
+int uv_prepare_start(void *prepare, void *cb);
+int uv_prepare_stop(void *prepare);
 
-int uv_check_init(uv_loop_t *loop, uv_check_t *check);
-int uv_check_start(uv_check_t *check, uv_check_cb cb);
-int uv_check_stop(uv_check_t *check);
+int uv_check_init(void *loop, void *check);
+int uv_check_start(void *check, void *cb);
+int uv_check_stop(void *check);
 
-int uv_getaddrinfo(uv_loop_t *loop, uv_getaddrinfo_t *req, uv_getaddrinfo_cb cb, const char *node, const char *service, const struct addrinfo *hints);
-void uv_freeaddrinfo(struct addrinfo *ai);
+int uv_getaddrinfo(void *loop, void *req, void *cb, const char *node, const char *service, const void *hints);
+void uv_freeaddrinfo(void *ai);
 
-int uv_interface_addresses(uv_interface_address_t **addresses, int *count);
-void uv_free_interface_addresses(uv_interface_address_t *addresses, int count);
+int uv_interface_addresses(void *addresses, int *count);
+void uv_free_interface_addresses(void *addresses, int count);
 
 const char *uv_strerror(int err);
 
 #ifdef __cplusplus
-}
+}  // namespace HSUV_NAMESPACE / extern "C"
 #endif
 
 #endif // UV_H

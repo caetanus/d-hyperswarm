@@ -98,12 +98,12 @@ attempted blind.
 - [ ] Phase 2: UDX via the libuv→vibe facade (decided facade over laundering, 2026-09-07)
   - [x] libudx vendored (`vendor/libudx`, pin 01d6630)
   - [x] header milestone: shim `uv.h` (`vendor/libudx-shim`), all 9 src/*.c compile against it
-  - [x] uv symbol isolation: facade renamed to `hsuv_*` (no global `uv_*`)
+  - [x] uv symbol isolation: facade renamed to `__d_hsuv_*` (no global `uv_*`)
   - [x] amalgamation: libudx built as ONE C++ TU in `namespace udx` — ALL symbols
         (internals + public API) enclosed under `udx::`, zero global `udx_*`/`uv_*`;
         C++↔D link proven (link test); D calls the API via extern(C++, "udx")
   - [x] loop + timer + buf: `Loop` runner on vibe (fire due timers → sleep to next
-        deadline/wake → repeat); hsuv_timer_*/now/hrtime/buf_init/close/is_active live;
+        deadline/wake → repeat); __d_hsuv_timer_*/now/hrtime/buf_init/close/is_active live;
         tests: one-shot fires once after timeout, repeating re-arms until stopped
   - [x] UDP on vibe UDPConnection: init/bind/recv_start (reader fiber → alloc+recv
         cbs)/getsockname/send (fiber)/try_send (raw non-blocking sendmsg)/set_ttl
