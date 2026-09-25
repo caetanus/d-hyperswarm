@@ -8,6 +8,7 @@
 /// options mirror the reference so callers read the same.
 module hyperswarm.swarm;
 
+import vibe.core.task : Task;
 import hyperswarm.dht.node : Dht;
 import std.conv : to;
 import hyperswarm.dht.messages : PeerRecord;
@@ -76,6 +77,30 @@ final class Hyperswarm
     private bool[string] connecting; // in-flight connects: by key hex, or hex@host:port
     private bool[string] topics; // joined topics (hex) still in client mode
     private bool destroyed;
+    // Every task this swarm spawns (announce/discover loops, dials). close() interrupts and
+    // joins them before the DHT goes away: a dial parked in a relay-hint request would
+    // otherwise resume after close and query a closed transport.
+    private Task[] tasks;
+    private Task closer;       // the deferred half of close(): joins `tasks`, then closes the DHT
+    private bool closeDone;
+
+    private void spawn(void delegate() nothrow dg)
+    {
+        import std.algorithm : remove;
+
+        if (destroyed)
+            return;   // closed: no new work, not even from a callback that returns late
+        tasks = tasks.remove!(t => !t.running);   // forget finished ones: bounded by what is live
+        tasks ~= runTask(dg);
+    }
+
+    /// Whether a close() has fully settled: our tasks joined and the DHT's own shutdown
+    /// finished. close() only starts the second half (see there): wait on this from a
+    /// fiber that is not one of the swarm's callbacks.
+    bool closeSettled() nothrow
+    {
+        return closeDone && dht.rpc.closeSettled();
+    }
     // Outbound connections whose stream exists but that are not yet in `connections`
     // (dialing / waiting to open): close() destroys them before the dht socket, so a
     // pre-registration stream never leaves the socket busy (UV_EBUSY) at teardown.
@@ -183,13 +208,13 @@ final class Hyperswarm
             // Announce the topic (so a lookup finds us) + announce-self (so the
             // connect handshake can be routed to us), and keep re-announcing so a
             // cold-table first announce self-corrects and the record stays fresh.
-            runTask(() nothrow { announceLoop(t); });
+            spawn(() nothrow { announceLoop(t); });
         }
         if (client && (hex in topics) is null)
         {
             topics[hex] = true;
             auto t = topic;
-            runTask(() nothrow { discoverLoop(t); });
+            spawn(() nothrow { discoverLoop(t); });
         }
     }
 
@@ -225,11 +250,42 @@ final class Hyperswarm
             {
             }
         pendingOut = null;
+        // The rest runs on a task of its own and close() returns now. close() is routinely
+        // called from inside the swarm's own callbacks (onConnection, onClose, onDiscover),
+        // on a task that is a CHILD of one we spawned: an onDiscover fires on a DHT request
+        // child of discoverLoop, whose query cleanup waits for that very child. Joining
+        // discoverLoop here would wait on the callback that is waiting on us — a deadlock,
+        // not a slow close. Deferred, the callback returns first and the join completes.
+        if (closer == Task.init)
+            try
+                closer = runTask(&finishClose);
+            catch (Exception)
+            {
+                finishClose();   // no event loop to hand it to: do it here
+            }
+    }
+
+    // The deferred half of close(): stop our own work before the DHT goes away — interrupt
+    // every task we spawned and wait for it — then close the DHT.
+    private void finishClose() nothrow
+    {
+        foreach (t; tasks)
+            if (t.running)
+            {
+                try
+                    t.interrupt();
+                catch (Exception)
+                {
+                }
+                t.joinUninterruptible();
+            }
+        tasks = null;
         try
             dht.close();
         catch (Exception)
         {
         }
+        closeDone = true;
     }
 
     // Server mode: (re-)announce the topic and ourselves on an interval. The
@@ -306,7 +362,7 @@ final class Hyperswarm
         auto pk = pubkey;
         auto hints = relayHints.dup;
         try
-            runTask(() nothrow { connectTo(pk, hints); });
+            spawn(() nothrow { connectTo(pk, hints); });
         catch (Exception)
             connecting.remove(hex);
     }
@@ -382,7 +438,7 @@ final class Hyperswarm
         connecting[key] = true;
         auto pk = pubkey;
         try
-            runTask(() nothrow {
+            spawn(() nothrow {
                 scope (exit)
                     connecting.remove(key);
                 try

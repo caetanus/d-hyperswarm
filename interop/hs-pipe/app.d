@@ -59,8 +59,9 @@ int main(string[] args)
     bool destroyClose; // client: end with conn.destroy() whose onClose closes the swarm
     bool abortBurn;    // client: queue the whole burn, then close the swarm without waiting
     bool closeYield;   // with --destroy-close: onClose sleeps 50 ms after closing the swarm
+    bool closeOnDiscover; // client: close the swarm from onDiscover, mid-lookup; exit 0 iff it settles
     auto help = getopt(args, "role", &role, "topic", &topicWord, "seed", &seed, "burn", &burnBytes,
-        "hold", &holdSecs, "ping-every", &pingEvery, "bootstrap", &bootstrap, "exit-on-close", &exitOnClose, "destroy-close", &destroyClose, "close-yield", &closeYield, "abort", &abortBurn);
+        "hold", &holdSecs, "ping-every", &pingEvery, "bootstrap", &bootstrap, "exit-on-close", &exitOnClose, "destroy-close", &destroyClose, "close-yield", &closeYield, "abort", &abortBurn, "close-on-discover", &closeOnDiscover);
     if (help.helpWanted)
     {
         writeln("hs-pipe --role server|client --topic <word> [--burn N] [--hold S] [--ping-every E]");
@@ -104,11 +105,32 @@ int main(string[] args)
                         // From this fiber the close only STARTS: leave the event loop once
                         // it has settled (on another fiber — this one must return first).
                         try runTask(() nothrow {
-                            try while (!swarm.dht.rpc.closeSettled()) sleep(5.msecs); catch (Exception) {}
+                            try while (!swarm.closeSettled()) sleep(5.msecs); catch (Exception) {}
                             try exitEventLoop(); catch (Exception) {}
                         }); catch (Exception) {}
                     };
             };
+            if (client && closeOnDiscover)
+                // onDiscover fires on a DHT request child of discoverLoop, whose query waits
+                // for that child: a close() that joined discoverLoop from here deadlocked.
+                swarm.onDiscover = (ubyte[32] pk) nothrow {
+                    try { writeln("[t+", stamp(), "s] discovered a peer — closing the swarm from onDiscover"); stdout.flush(); } catch (Exception) {}
+                    try swarm.close(); catch (Exception) {}
+                    try runTask(() nothrow {
+                        try
+                        {
+                            immutable until = MonoTime.currTime + 15.seconds;
+                            while (!swarm.closeSettled() && MonoTime.currTime < until)
+                                sleep(5.msecs);
+                            immutable ok = swarm.closeSettled();
+                            writeln("[t+", stamp(), "s] close from onDiscover: settled=", ok,
+                                " leftovers=", swarm.dht.rpc.closeLeftovers()); stdout.flush();
+                            result = ok ? 0 : 1;
+                        }
+                        catch (Exception) {}
+                        try exitEventLoop(); catch (Exception) {}
+                    }); catch (Exception) {}
+                };
             swarm.join(topic, /*client*/ client, /*serverMode*/ !client);
             writeln("[t+", stamp(), "s] joined (", client ? "client: lookup + connect" : "server: announced + listening", ")"); stdout.flush();
             if (!client)
@@ -219,9 +241,9 @@ int main(string[] args)
             try
             {
                 immutable until = MonoTime.currTime + 10.seconds;
-                while (!swarm.dht.rpc.closeSettled() && MonoTime.currTime < until)
+                while (!swarm.closeSettled() && MonoTime.currTime < until)
                     sleep(5.msecs);
-                writeln("[t+", stamp(), "s] closed: settled=", swarm.dht.rpc.closeSettled(),
+                writeln("[t+", stamp(), "s] closed: settled=", swarm.closeSettled(),
                     " leftovers=", swarm.dht.rpc.closeLeftovers()); stdout.flush();
             }
             catch (Exception) {}

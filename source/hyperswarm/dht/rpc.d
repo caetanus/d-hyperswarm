@@ -428,6 +428,10 @@ final class Rpc
         scope const(ubyte)[] value = null, scope const(ubyte)[] token = null,
         bool internal = true, Duration timeout = 2.seconds, void* viaSock = null)
     {
+        // a closing/closed RPC takes no new work: late callers (a task resumed after
+        // Hyperswarm.close) get an error instead of queueing on a socket being torn down
+        if (closing)
+            throw new Exception("dht rpc: closed");
         immutable tid = nextTid++;
         if (nextTid == 0)
             nextTid = 1;
