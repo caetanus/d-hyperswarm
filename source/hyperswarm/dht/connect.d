@@ -511,11 +511,16 @@ PunchResult connectViaHolepunch(Dht dht, ubyte[32] publicKey, Keypair keyPair,
         return result;
     }
 
-    // The hole opening fires onConnect(punchedSocket, peer); form the connection there.
-    Connection conn;
+    // The hole opening fires onConnect(punchedSocket, peer); form the connection there. It
+    // is owned by `punched` until this dial hands it over: interrupted mid-wait
+    // (Hyperswarm.close), timed out, or punched late, it is destroyed — never left live
+    // and registered nowhere (neither the swarm's connections nor its pendingOut).
+    PunchedHandoff!Connection punched;
+    scope (exit)
+        punched.finish();
     puncher.onConnect = (void* sock, Address peer) nothrow {
         try
-            conn = formPunchedConnection(dht, sock, peer, ch);
+            punched.formed(formPunchedConnection(dht, sock, peer, ch));
         catch (Exception)
         {
         }
@@ -530,14 +535,69 @@ PunchResult connectViaHolepunch(Dht dht, ubyte[32] publicKey, Keypair keyPair,
     immutable steps = cast(int)(punchTimeout.total!"msecs" / 100);
     foreach (_; 0 .. steps)
     {
-        if (conn !is null)
+        if (punched.has)
             break;
         sleep(100.msecs);
     }
-    if (conn !is null)
+    if (punched.has)
     {
         result.outcome = PunchOutcome.punched;
-        result.conn = conn;
+        result.conn = punched.take();
     }
     return result; // failed on timeout
+}
+
+/// Ownership of the connection a hole punch forms on its own callback, until the dial that
+/// asked for it hands it over. Whatever is not handed over is destroyed: the dial ending
+/// without taking it (an interrupt from Hyperswarm.close, a timeout), a punch that lands
+/// after the dial finished, a second punch while one is held.
+struct PunchedHandoff(C)
+{
+    private C conn;
+    private bool finished, handedOff;
+
+    /// The puncher formed `c`.
+    void formed(C c) nothrow
+    {
+        if (c is null)
+            return;
+        if (finished || handedOff || conn !is null)
+            destroyQuietly(c); // too late, or not the first: nobody would own it
+        else
+            conn = c;
+    }
+
+    bool has() const nothrow
+    {
+        return conn !is null && !handedOff;
+    }
+
+    /// The dial takes it: from here the swarm owns it.
+    C take() nothrow
+    {
+        handedOff = true;
+        auto c = conn;
+        conn = null;
+        return c;
+    }
+
+    /// The dial is over (every exit): destroy what was not handed over.
+    void finish() nothrow
+    {
+        finished = true;
+        if (conn !is null)
+        {
+            destroyQuietly(conn);
+            conn = null;
+        }
+    }
+
+    private static void destroyQuietly(C c) nothrow
+    {
+        try
+            c.destroy();
+        catch (Exception)
+        {
+        }
+    }
 }
