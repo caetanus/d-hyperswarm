@@ -460,6 +460,10 @@ final class Loop
             p = h in timers;
         }
         p.cb = cb;
+        // the clock the deadline counts from, fresh: libudx starts timers from the UDP reader
+        // task too, outside the loop's iterations (where nowMs is refreshed), and a stale
+        // nowMs made a short timer (the 2 ms delayed ACK) expire on arrival
+        updateNow();
         p.deadline = nowMs + timeout;
         p.repeat = repeat;
         p.active = true;

@@ -382,6 +382,8 @@ struct udx_stream_s {
   int nrefs;        // # of libuv handles open (2 timer, 1 prepare)
   uv_timer_t timer; // RTO, RACK_REO,TLP, ZWP and keepalive timer. stream.pending_timer tells which is currently set (if any)
   uv_timer_t refill_pacing_timer;
+  uv_timer_t delack_timer; // d-hyperswarm: the delayed ACK of a lone in-order data packet
+  uint32_t delack_pending; // d-hyperswarm: in-order data packets received and not yet acked
 
   size_t inflight;
 

@@ -39,6 +39,11 @@
 #define UDX_MAX_RTO_TIMEOUTS 6
 
 #define UDX_RTO_MAX_MS        30000
+#define UDX_RTO_MIN_MS        200   // d-hyperswarm: was a hardcoded 1000 (see the RTO update)
+// d-hyperswarm: delayed ACK, as TCP and QUIC do — one ACK per 2 in-order data packets, a lone
+// one acked within UDX_DELACK_MS. Upstream acked every packet: 1 ACK (48 B) per 1500 B of data,
+// ~3.5% of a shared link (Wi-Fi airtime, a loopback netem) spent on ACKs, TCP half of that.
+#define UDX_DELACK_MS         2
 #define UDX_RTT_MAX_MS        30000
 #define UDX_RTT_MIN_WINDOW_MS 300000            // 300 seconds, same as Linux default
 #define UDX_DEFAULT_RWND_MAX  (4 * 1024 * 1024) // arbitrary, ~175 1500 mtu packets, @20ms latency = 416 mbits/sec
@@ -308,9 +313,10 @@ udx_write_header (uint8_t header[20], udx_stream_t *stream, int type) {
 // returns 1 on success, zero if packet can't be promoted to a probe packet
 static int
 mtu_probeify_packet (udx_packet_t *pkt, int wanted_size) {
-  if (wanted_size > pkt->size) {
-    return 0;
-  }
+  // (d-hyperswarm: the upstream check here was `wanted_size > pkt->size → return 0`, which
+  // refused every packet a probe can be made of — a full packet is always smaller than the
+  // probe size — so the MTU search never left UDX_MTU_BASE (1200 B datagrams on a 1500 B
+  // path). The real bound is the padding: 1..255 bytes, checked below.)
 
   // cannot probeify a packet with 1) no data 2) already has padding
   if (pkt->nwbufs < 1 || pkt->header[3] != 0) {
@@ -321,7 +327,7 @@ mtu_probeify_packet (udx_packet_t *pkt, int wanted_size) {
 
   int header_size = (ipv4 ? UDX_IPV4_HEADER_SIZE : UDX_IPV6_HEADER_SIZE) - 20;
   int padding_size = wanted_size - (pkt->size + (ipv4 ? UDX_IPV4_HEADER_SIZE : UDX_IPV6_HEADER_SIZE) - 20);
-  if (padding_size > 255) {
+  if (padding_size <= 0 || padding_size > 255) {
     return 0;
   }
   debug_printf("mtu: probeify rid=%u seq=%u size=%u wanted=%d padding=%d\n", udx__swap_uint32_if_be(((unsigned int *) pkt->header)[1]), pkt->seq, pkt->size + header_size, wanted_size, padding_size);
@@ -476,9 +482,11 @@ close_stream_internal (udx_stream_t *stream, int err) {
 
   uv_timer_stop(&stream->timer);
   uv_timer_stop(&stream->refill_pacing_timer);
+  uv_timer_stop(&stream->delack_timer);
 
   uv_close((uv_handle_t *) &stream->timer, finalize_maybe);
   uv_close((uv_handle_t *) &stream->refill_pacing_timer, finalize_maybe);
+  uv_close((uv_handle_t *) &stream->delack_timer, finalize_maybe);
   uv_close((uv_handle_t *) &stream->pending_packet_prepare, finalize_maybe);
 
   if (udx->teardown && socket != NULL && socket->streams == NULL) {
@@ -571,6 +579,11 @@ send_ack (udx_stream_t *stream) {
     stream->ack_needed = true; // defer until we are connected
     return;
   }
+  // d-hyperswarm: this ACK covers whatever a delayed one was waiting for
+  if (stream->delack_pending) {
+    stream->delack_pending = 0;
+    uv_timer_stop(&stream->delack_timer);
+  }
   // todo: if data is available for writing then write a data + ack packet
 
   struct {
@@ -660,6 +673,13 @@ send_ack (udx_stream_t *stream) {
     assert(stream->write_queue.len == 0);
     close_stream(stream, 0);
   }
+}
+
+// d-hyperswarm: the delayed ACK's timer (a lone in-order data packet waited UDX_DELACK_MS)
+static void
+on_delack_timeout (uv_timer_t *timer) {
+  udx_stream_t *stream = timer->data;
+  if (stream->delack_pending) send_ack(stream);
 }
 
 static bool
@@ -1308,6 +1328,13 @@ ack_packet (udx_stream_t *stream, uint32_t seq, int sack, udx_rate_sample_t *rs)
   if (stream->mtu_state == UDX_MTU_STATE_BASE || stream->mtu_state == UDX_MTU_STATE_ERROR) {
     stream->mtu_state = UDX_MTU_STATE_SEARCH;
     stream->mtu_probe_wanted = true;
+    // (d-hyperswarm: the first probe must be bigger than what already works — at the base size
+    // a full packet needs zero padding, which probeify rejects, so a stream of only full
+    // packets never started the search)
+    if (stream->mtu_probe_size <= stream->mtu) {
+      stream->mtu_probe_size = stream->mtu + UDX_MTU_STEP;
+      if (stream->mtu_probe_size >= stream->mtu_max) stream->mtu_probe_size = stream->mtu_max;
+    }
   }
 
   if (sack) {
@@ -1346,8 +1373,10 @@ ack_packet (udx_stream_t *stream, uint32_t seq, int sack, udx_rate_sample_t *rs)
 
     stream->tlp_permitted = true;
 
-    // RTO <- SRTT + max (G, K*RTTVAR) where K is 4 maxed with 1s
-    stream->rto = max_uint32(stream->srtt + 4 * stream->rttvar, 1000);
+    // RTO <- SRTT + max (G, K*RTTVAR) where K is 4, floored at UDX_RTO_MIN_MS.
+    // (d-hyperswarm: RFC 6298's 1 s floor, upstream's, stalled the stream a whole second
+    // on every loss the fast paths miss; Linux TCP floors at 200 ms, and so do we)
+    stream->rto = max_uint32(stream->srtt + 4 * stream->rttvar, UDX_RTO_MIN_MS);
 
     if (stream->rto > UDX_RTO_MAX_MS) {
       debug_printf("rto: computed rto=%u ms, capping to %u ms\n", stream->rto, UDX_RTO_MAX_MS);
@@ -1772,7 +1801,14 @@ process_packet (udx_socket_t *socket, char *buf, ssize_t buf_len, struct sockadd
   }
 
   if (type & UDX_HEADER_DATA_OR_END) {
-    send_ack(stream);
+    // d-hyperswarm: delayed ACK (see UDX_DELACK_MS). At once for the end, for anything while
+    // a gap is open (the sender's fast recovery lives on those), and for every second packet.
+    if ((type & UDX_HEADER_END) || stream->out_of_order > 0 || stream->delack_pending >= 1) {
+      send_ack(stream);
+    } else {
+      stream->delack_pending++;
+      uv_timer_start(&stream->delack_timer, on_delack_timeout, UDX_DELACK_MS, 0);
+    }
     if (stream->status & UDX_STREAM_DEAD) {
       return 1;
     }
@@ -2334,7 +2370,11 @@ udx_stream_init (udx_t *udx, udx_stream_t *stream, uint32_t local_id, udx_stream
   uv_timer_init(udx->loop, &stream->refill_pacing_timer);
   stream->refill_pacing_timer.data = stream;
 
-  stream->nrefs = 3; // timer, refill_pacing_timer, pending_packet_prepare
+  uv_timer_init(udx->loop, &stream->delack_timer);
+  stream->delack_timer.data = stream;
+  stream->delack_pending = 0;
+
+  stream->nrefs = 4; // timer, refill_pacing_timer, delack_timer, pending_packet_prepare
 
   udx__queue_init(&stream->inflight_queue);
   udx__queue_init(&stream->retransmit_queue);
