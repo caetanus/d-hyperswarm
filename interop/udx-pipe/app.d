@@ -15,6 +15,7 @@ import core.sys.posix.netinet.in_ : sockaddr_in;
 import core.sys.posix.arpa.inet : htons, inet_pton;
 import std.conv : to;
 import std.getopt : getopt;
+import std.algorithm.searching : startsWith;
 import std.stdio : writeln, stdout;
 import std.string : indexOf, toStringz;
 
@@ -71,6 +72,9 @@ int main(string[] args)
                     seeds ~= Address(b[0 .. k].idup, 4, b[k + 1 .. $].to!ushort);
             }
             auto nat = sampleNatOn(rpc, rpc.sockPtr, seeds, true);
+            // a peer on this host (an emulated link in a network namespace): no mapping to learn
+            if (nat.addresses.length == 0 && peerStr.startsWith("127."))
+                nat.addresses ~= Address("127.0.0.1", 4, rpc.localPort);
             if (nat.addresses.length == 0)
                 throw new Exception("could not learn our external mapping (bootstrap unreachable)");
             auto mine = nat.addresses[0];

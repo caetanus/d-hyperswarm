@@ -987,12 +987,31 @@ send_packets (udx_stream_t *stream) {
 // if not 'from_now' then we use the saved rto in `stream->next_rto_ts`
 // this is used when the reorder timeout or the tail-loss probe timer is
 // set over top of the normal rto.
+// d-hyperswarm: RFC 6298 5.5 exponential backoff. Upstream re-arms every RTO at a flat 2x the
+// RTO and gives up after UDX_MAX_RTO_TIMEOUTS of them: with its 1 s floor that tolerated a
+// ~12 s outage, with our 200 ms floor only ~2.4 s — a phone on 4G (the radio waking, a cell
+// change) or a busy peer lost the link. The timer doubles per consecutive timeout of the
+// oldest unacked packet instead (capped at UDX_RTO_MAX_MS), ~25 s before giving up.
+static uint32_t
+rto_backoff (udx_stream_t *stream, uint32_t extra) {
+  // the oldest packet still out: usually at remote_acked, but that slot can be empty (a
+  // SACKed packet the cumulative ack has not passed yet) — then the first one after it
+  udx_packet_t *head = NULL;
+  for (uint32_t seq = stream->remote_acked; seq != stream->seq && head == NULL; seq++) {
+    head = (udx_packet_t *) udx__cirbuf_get(&stream->outgoing, seq);
+  }
+  uint32_t n = (head ? head->rto_timeouts : 0) + extra;
+  if (n > 8) n = 8;
+  uint64_t r = (uint64_t) stream->rto << n;
+  return r > UDX_RTO_MAX_MS ? UDX_RTO_MAX_MS : (uint32_t) r;
+}
+
 static void
 rearm_rto (udx_stream_t *stream, bool from_now) {
   if (stream->seq == stream->remote_acked) {
     stream_timer_stop(stream);
   } else {
-    uint64_t rto = stream->rto;
+    uint64_t rto = rto_backoff(stream, 0);
     if (!from_now) {
       assert(stream->pending_timer == UDX_TIMER_RACK_REO || stream->pending_timer == UDX_TIMER_TLP);
       int64_t rto_delta_ms = stream->next_rto_ts - uv_now(stream->udx->loop);
@@ -1224,7 +1243,8 @@ udx_rto_timeout (uv_timer_t *timer) {
   stream->tlp_is_retrans = false;
 
   assert(!(stream->status & UDX_STREAM_CLOSED));
-  stream_timer_start(stream, UDX_TIMER_RTO, stream->rto * 2);
+  // (the head packet's timeout count goes up by one below: back off from that)
+  stream_timer_start(stream, UDX_TIMER_RTO, rto_backoff(stream, 1));
 
   // zero retransmit queue
   udx__queue_init(&stream->retransmit_queue);
@@ -1875,7 +1895,7 @@ arm_stream_timers (udx_stream_t *stream, bool arm_tlp) {
   assert(stream->status != UDX_STREAM_CLOSED);
 
   if (stream->pending_timer == UDX_TIMER_NONE || stream->pending_timer == UDX_TIMER_ZWP || stream->pending_timer == UDX_TIMER_KEEPALIVE) {
-    stream_timer_start(stream, UDX_TIMER_RTO, stream->rto);
+    stream_timer_start(stream, UDX_TIMER_RTO, rto_backoff(stream, 0));
   }
 
   // rack 7.2 rearm tlp timer
