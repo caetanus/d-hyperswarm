@@ -324,20 +324,42 @@ final class Hyperswarm
     // Periodically look the topic up and connect to any newly-seen server.
     private void discoverLoop(ubyte[32] topic) nothrow
     {
+        import core.time : MonoTime;
+        import vibe.core.log : logInfo;
+
         immutable hex = toHex(topic[]);
-        while (!destroyed && (hex in topics) !is null)
+        int idleRound;   // lookups in a row that left us with no connection at all
+        for (int round = 1; !destroyed && (hex in topics) !is null; round++)
         {
+            immutable t0 = MonoTime.currTime;
+            long firstMs = -1;
+            int found;
             try
             {
                 // Connect on the first record the DHT returns; the walk finishes behind.
-                dht.lookupEach(topic, (PeerRecord p) nothrow { handlePeer(p.publicKey, p.relayAddresses); });
+                dht.lookupEach(topic, (PeerRecord p) nothrow {
+                    if (found++ == 0)
+                        firstMs = (MonoTime.currTime - t0).total!"msecs";
+                    handlePeer(p.publicKey, p.relayAddresses);
+                });
             }
             catch (Exception)
             {
             }
-            // The reference refreshes every ~10 min; a short interval keeps the
-            // interop snappy without hammering the network.
-            for (int i = 0; i < 100 && !destroyed && (hex in topics) !is null; i++)
+            try
+                logInfo("hyperswarm: lookup #%s — %s peer record(s), first after %s ms, walk %s ms",
+                    round, found, firstMs, (MonoTime.currTime - t0).total!"msecs");
+            catch (Exception)
+            {
+            }
+            // The reference refreshes every ~10 min; 10 s keeps the interop snappy without
+            // hammering the network — once connected. With nobody connected yet (a cold
+            // routing table at start misses the record, the peer is still announcing, a
+            // link just dropped) the next lookup goes right away and backs off: 0.5, 1, 2,
+            // 4, 8, 10 s. Waiting the full 10 s there cost 10–20 s per connection.
+            idleRound = liveConnections() == 0 && connecting.length == 0 ? idleRound + 1 : 0;
+            immutable ticks = idleRound == 0 ? 100 : (idleRound >= 6 ? 100 : 5 << (idleRound - 1));
+            for (int i = 0; i < ticks && !destroyed && (hex in topics) !is null; i++)
                 try
                     sleep(100.msecs);
                 catch (Exception)
