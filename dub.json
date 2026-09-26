@@ -304,6 +304,20 @@
 				"source",
 				"interop/hs-pipe"
 			]
+		},
+		{
+			"name": "protomux-interop",
+			"targetType": "executable",
+			"targetName": "protomux-interop",
+			"mainSourceFile": "interop/protomux-interop/app.d",
+			"sourcePaths": [
+				"source",
+				"interop/protomux-interop"
+			],
+			"importPaths": [
+				"source",
+				"interop/protomux-interop"
+			]
 		}
 	]
 }

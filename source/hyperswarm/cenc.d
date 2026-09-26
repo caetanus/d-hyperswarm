@@ -324,6 +324,56 @@ struct Buffer
     }
 }
 
+/// `c.optionalBuffer`: like Buffer, but a zero length stands for "no buffer" (null) — and
+/// encoding null (or an empty buffer) writes that single 0.
+struct OptionalBuffer
+{
+    static void preencode(ref State s, const(ubyte)[] b)
+    {
+        if (b.length)
+            Buffer.preencode(s, b);
+        else
+            s.end++;
+    }
+    static void encode(ref State s, const(ubyte)[] b)
+    {
+        if (b.length)
+            Buffer.encode(s, b);
+        else
+            s.buffer[s.start++] = 0;
+    }
+    static ubyte[] decode(ref State s)
+    {
+        immutable len = cast(size_t)Uint.decode(s);
+        if (len == 0)
+            return null;
+        requireBytes(s, len);
+        auto b = s.buffer[s.start .. s.start + len];
+        s.start += len;
+        return b;
+    }
+}
+
+/// `c.raw`: the bytes as they are, no length prefix; decoding takes the rest of the state.
+struct Raw
+{
+    static void preencode(ref State s, const(ubyte)[] b)
+    {
+        s.end += b.length;
+    }
+    static void encode(ref State s, const(ubyte)[] b)
+    {
+        s.buffer[s.start .. s.start + b.length] = b[];
+        s.start += b.length;
+    }
+    static ubyte[] decode(ref State s)
+    {
+        auto b = s.buffer[s.start .. s.end];
+        s.start = s.end;
+        return b;
+    }
+}
+
 /// A fixed-width byte field of exactly N bytes (no length prefix). `c.fixed(n)`.
 template Fixed(size_t N)
 {
