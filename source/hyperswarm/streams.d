@@ -30,11 +30,13 @@ import vibe.core.sync : LocalManualEvent, createManualEvent;
 
 /// The protomux protocol name of a stream channel.
 enum streamProtocol = "hyperswarm/stream/1";
-/// Bytes a side may send before the receiver's first credit (and the most it may have
-/// outstanding at any time).
+/// Bytes a side may send before the receiver's first credit: the initial window both
+/// sides assume. A receiver may widen its own window past it (see `window` on open/accept)
+/// by granting the difference as credit as soon as the channel opens — credit is additive,
+/// so the wire needs no negotiation.
 enum size_t streamWindow = 1024 * 1024;
 /// Largest data message (one secret-stream message each).
-enum size_t streamChunk = 32 * 1024;
+enum size_t streamChunk = 64 * 1024;
 /// How long a closed stream's last bytes may take to leave through a stalled socket.
 enum Duration drainTimeout = 10.seconds;
 
@@ -50,6 +52,7 @@ final class ChannelStream
 
     private ulong sendCredit = streamWindow;   // what the remote still lets us send
     private ulong recvAllowed = streamWindow;  // what we granted and did not receive yet
+    private size_t recvWindow = streamWindow;  // this side's receive window (grown by grow())
     private ubyte[][] inq;                     // received, not read yet
     private size_t inqOff;                     // read so far of inq[0]
     private size_t consumed;                   // read and not granted back yet
@@ -105,10 +108,23 @@ final class ChannelStream
         ev.emit();
     }
 
+    // Widen this side's receive window to `window` (never narrows): the extra is granted
+    // at once. Called once the channel is open.
+    private void grow(size_t window)
+    {
+        if (window <= recvWindow || closed_)
+            return;
+        immutable extra = window - recvWindow;
+        recvWindow = window;
+        recvAllowed += extra;
+        credit.send(extra);
+    }
+
     /// Open a stream to `service` on the remote end of `mux`. Throws if the remote rejects
     /// the channel (nobody accepts streams there) or `timeout` passes; a service the remote
     /// does not offer opens and is closed at once (the first read returns 0).
-    static ChannelStream open(Protomux mux, string service, Duration timeout = 10.seconds)
+    static ChannelStream open(Protomux mux, string service, Duration timeout = 10.seconds,
+        size_t window = streamWindow)
     {
         import std.random : uniform;
 
@@ -134,6 +150,7 @@ final class ChannelStream
         }
         if (!s.opened_)
             throw new Exception("stream: " ~ service ~ " refused");
+        s.grow(window);
         return s;
     }
 
@@ -142,7 +159,8 @@ final class ChannelStream
     /// is closed when `onStream` returns. At most
     /// `maxStreams` at once: past that the remote's opens are rejected (each stream can
     /// hold a window of data, a task and a socket — a peer must not open them unbounded).
-    static void accept(Protomux mux, void delegate(ChannelStream s) onStream, size_t maxStreams = 32)
+    static void accept(Protomux mux, void delegate(ChannelStream s) onStream, size_t maxStreams = 32,
+        size_t window = streamWindow)
     {
         auto live = new size_t;
         mux.pair(streamProtocol, null, (const(ubyte)[] id) {
@@ -164,6 +182,7 @@ final class ChannelStream
             ch.onopen = (Channel c) {
                 s.opened_ = true;
                 s.service = cast(string) c.handshake.idup;
+                s.grow(window);
                 s.ev.emit();
                 *started = true;
                 runTask((ChannelStream st) nothrow {
@@ -203,7 +222,11 @@ final class ChannelStream
             }
         }
         consumed += n;
-        if (consumed >= streamWindow / 2 && !closed_ && !remoteEnded)
+        // grant back often (an eighth of the window, at least a chunk): the sender then
+        // always has most of the window in flight — at half, a whole round trip of the
+        // pipe idled at every grant
+        immutable grantAt = recvWindow / 8 > streamChunk ? recvWindow / 8 : streamChunk;
+        if (consumed >= grantAt && !closed_ && !remoteEnded)
         {
             recvAllowed += consumed;
             credit.send(consumed);
@@ -259,6 +282,10 @@ final class ChannelStream
 
     /// Closed (by either side) — as opposed to ended cleanly.
     bool isClosed() const nothrow { return closed_; }
+
+    /// The remote ended its side cleanly (its FIN arrived): once what it sent is read,
+    /// `read` returns 0 for this reason rather than a close.
+    bool ended() const nothrow { return remoteEnded; }
 
     /// Both sides ended: nothing more will flow.
     bool finished() const nothrow { return closed_ || (localEnded && remoteEnded && inq.length == 0); }
@@ -562,4 +589,80 @@ unittest
     assert(echoed == big, "echo mismatch");
     assert(refused);
     assert(seenService == "nope");
+}
+
+unittest
+{
+    // a receiver that widens its window: the opener writes 3 MiB before a byte is read
+    import vibe.core.core : runTask, runEventLoop, exitEventLoop, sleep;
+
+    Protomux a, b;
+    ubyte[][] toA, toB;
+    a = new Protomux((const(ubyte)[] f) nothrow { toB ~= f.dup; });
+    b = new Protomux((const(ubyte)[] f) nothrow { toA ~= f.dup; });
+    bool pumping = true;
+    runTask(() nothrow {
+        while (pumping)
+        {
+            try
+            {
+                while (toA.length || toB.length)
+                {
+                    auto fa = toA, fb = toB;
+                    toA = null;
+                    toB = null;
+                    foreach (f; fb)
+                        b.onFrame(f);
+                    foreach (f; fa)
+                        a.onFrame(f);
+                }
+                sleep(1.msecs);
+            }
+            catch (Exception)
+            {
+            }
+        }
+    });
+    bool readerStarted, wroteAllFirst;
+    size_t got;
+    ChannelStream.accept(b, (ChannelStream s) {
+        sleep(300.msecs);   // not reading yet
+        readerStarted = true;
+        ubyte[65536] buf;
+        while (true)
+        {
+            immutable n = s.read(buf[]);
+            if (n == 0)
+                break;
+            got += n;
+        }
+    }, 32, 3 * 1024 * 1024);
+    runTask(() nothrow {
+        try
+        {
+            auto s = ChannelStream.open(a, "wide");
+            sleep(20.msecs);   // the extra credit lands
+            s.write(new ubyte[3 * 1024 * 1024]);
+            wroteAllFirst = !readerStarted;
+            s.end();
+            foreach (_; 0 .. 300)
+            {
+                if (got == 3 * 1024 * 1024)
+                    break;
+                sleep(10.msecs);
+            }
+        }
+        catch (Exception)
+        {
+        }
+        pumping = false;
+        try
+            exitEventLoop();
+        catch (Exception)
+        {
+        }
+    });
+    runEventLoop();
+    assert(wroteAllFirst, "the widened window did not take");
+    assert(got == 3 * 1024 * 1024);
 }
