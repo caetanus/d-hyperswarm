@@ -286,6 +286,25 @@ final class Connection
         }
     }
 
+    /// The udx stream's transport state as one log-ready line (mtu, srtt, rto, cwnd,
+    /// what is in flight and outstanding, losses, retransmits, RTOs, the remote window,
+    /// packets received) — for diagnosing a link that went quiet. "" once closed.
+    string linkStats() nothrow
+    {
+        import hyperswarm.udx.udx : hs_udx_stream_stats;
+        import std.format : format;
+
+        if (closed || stream is null)
+            return "";
+        ulong[12] v;
+        hs_udx_stream_stats(stream, v.ptr);
+        try
+            return format("mtu=%s(state %s) srtt=%sms rto=%sms cwnd=%s inflight=%sB outstanding=%s lost=%s retx=%s rtos=%s rwnd=%s rx=%s",
+                v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11]);
+        catch (Exception)
+            return "";
+    }
+
     /// Send encrypted application data to the peer.
     void write(scope const(ubyte)[] data) nothrow
     {

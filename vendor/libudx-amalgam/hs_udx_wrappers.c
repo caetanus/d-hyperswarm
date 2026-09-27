@@ -71,3 +71,23 @@ int hs_udx_stream_destroy (void *stream) {
   return udx_stream_destroy((udx_stream_t *) stream);
 }
 
+
+/* Diagnostics: a snapshot of one stream's transport state, for a log line when a link goes
+   quiet. out[] = mtu, mtu_state, srtt ms, rto ms, cwnd (packets), inflight bytes, packets
+   outstanding (seq - remote_acked), lost packets, retransmits, rto count, remote rwnd,
+   packets received (ack). */
+void hs_udx_stream_stats (void *stream, uint64_t out[12]) {
+  udx_stream_t *s = (udx_stream_t *) stream;
+  out[0] = s->mtu;
+  out[1] = (uint64_t) s->mtu_state;
+  out[2] = s->srtt;
+  out[3] = s->rto;
+  out[4] = s->cwnd;
+  out[5] = s->inflight;
+  out[6] = (uint32_t) (s->seq - s->remote_acked);
+  out[7] = s->lost;
+  out[8] = s->retransmit_count;
+  out[9] = s->rto_count;
+  out[10] = s->send_rwnd;
+  out[11] = s->ack;
+}

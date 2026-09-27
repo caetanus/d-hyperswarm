@@ -46,6 +46,8 @@ int hs_udx_stream_read_start(void* stream, void* read_cb);
 int hs_udx_stream_write_sizeof(int nwbufs);
 int hs_udx_stream_write(void* req, void* stream, const(uv_buf_t)* bufs, uint bufs_len, void* ack_cb);
 int hs_udx_stream_destroy(void* stream);
+/// mtu, mtu_state, srtt, rto, cwnd, inflight, outstanding, lost, retransmits, rtos, remote rwnd, acked-in.
+void hs_udx_stream_stats(void* stream, ulong* out12);
 
 // Callback ABIs (extern(C) functions passed as void* to the wrappers above).
 alias UdxIdleCb = extern (C) void function(void* udx) nothrow;
