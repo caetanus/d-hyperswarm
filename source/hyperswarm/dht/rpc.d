@@ -131,7 +131,7 @@ final class Rpc
     // Our own address as other nodes report it (the reply `to` field): a majority
     // vote across responders, so we advertise a reachable address rather than a
     // hard-coded loopback. host is empty until we've heard from a node.
-    private uint[string] _selfVotes;
+    private Address[] _selfWindow;   // the most recent views of our address (recordSelf)
     private Address _remoteAddr;
 
     // Per-pool-socket sink for 1-byte HOLEPUNCH beacons (installed by the
@@ -186,24 +186,20 @@ final class Rpc
         return _remoteAddr;
     }
 
-    // Fold a responder's view of our address into the running majority vote.
+    // Fold a responder's view of our address into the majority of the RECENT views: the
+    // last selfWindowMax replies, ties to the newest. A lifetime tally never let go of an
+    // old mapping — after hours on one, a changed NAT/CGNAT mapping needed as many votes
+    // as the old one had ever gathered, and meanwhile we announced (and handed out in
+    // handshakes) an address that no longer reached us.
+    private enum selfWindowMax = 32;
     private void recordSelf(Address to) nothrow
     {
         if (to.host.length == 0 || to.port == 0)
             return;
-        try
-        {
-            immutable key = format("%s:%d", to.host, to.port);
-            immutable n = (_selfVotes.get(key, 0) + 1);
-            _selfVotes[key] = n;
-            immutable best = _remoteAddr.host.length
-                ? _selfVotes.get(format("%s:%d", _remoteAddr.host, _remoteAddr.port), 0) : 0;
-            if (n >= best)
-                _remoteAddr = to;
-        }
-        catch (Exception)
-        {
-        }
+        _selfWindow ~= to;
+        if (_selfWindow.length > selfWindowMax)
+            _selfWindow = _selfWindow[$ - selfWindowMax .. $].dup;
+        _remoteAddr = recentMajority(_selfWindow);
     }
 
     /// The udx instance the rpc socket lives on — the connection layer opens its
@@ -558,4 +554,42 @@ final class Rpc
             }
         }
     }
+}
+
+/// The address most of `window` (oldest first) agrees on; a tie goes to the newest.
+Address recentMajority(const(Address)[] window) pure nothrow @safe
+{
+    size_t bestCount;
+    Address best;
+    foreach_reverse (a; window)   // newest first: a tie keeps the newer
+    {
+        size_t n;
+        foreach (b; window)
+            if (b.host == a.host && b.port == a.port)
+                n++;
+        if (n > bestCount)
+        {
+            bestCount = n;
+            best = a;
+        }
+    }
+    return best;
+}
+
+unittest
+{
+    auto old = Address("1.2.3.4", 4, 1000), fresh = Address("5.6.7.8", 4, 2000);
+    Address[] w;
+    foreach (i; 0 .. 32)
+        w ~= old;
+    assert(recentMajority(w) == old);
+    // the mapping changed: once the recent window agrees, the old one is gone — not after
+    // as many votes as it had gathered over hours
+    foreach (i; 0 .. 17)
+    {
+        w ~= fresh;
+        w = w[$ > 32 ? $ - 32 : 0 .. $];
+    }
+    assert(recentMajority(w) == fresh);
+    assert(recentMajority([old, fresh]) == fresh);   // a tie: the newer
 }

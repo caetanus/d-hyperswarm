@@ -422,6 +422,22 @@ final class Server
                 accepted.remove(sp);
                 conn.destroy();
             }
+            else if ((sp in accepted) !is null)
+            {
+                // the SYN came (the firewall callback took it out of g_incoming) but the
+                // secret-stream never opened: give it one more wait, then drop it — these
+                // piled up over a long uptime, never destroyed
+                try
+                    sleep(waitSecs.seconds);
+                catch (Exception)
+                {
+                }
+                if (auto c = sp in accepted)
+                {
+                    accepted.remove(sp);
+                    (*c).destroy();
+                }
+            }
             if (cleanupPunch)
             {
                 if (auto s = cleanupId in holepunches)

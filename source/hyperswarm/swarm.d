@@ -295,23 +295,51 @@ final class Hyperswarm
     // expires. Runs until the swarm is closed.
     private void announceLoop(ubyte[32] topic) nothrow
     {
+        import core.time : MonoTime;
+        import vibe.core.log : logInfo, logWarn;
+
         immutable ticks = cast(int)(announceInterval.total!"msecs" / 100);
+        int round;
+        bool lastBad = true;   // round 1 logs anyway
         while (!destroyed)
         {
+            round++;
+            immutable t0 = MonoTime.currTime;
+            int self = -1, stored = -1;
+            size_t nrelays;
+            string failure;
             try
             {
-                server.listen(); // announce-self under BLAKE2b(publicKey)
+                self = server.listen(); // announce-self under BLAKE2b(publicKey)
                 // The topic record's relayAddresses are the DHT nodes a client can
                 // send our PEER_HANDSHAKE through (the ones the announce-self landed
                 // on, which hold our router entry) — hyperdht's semantics, and what
                 // lets a client skip the FIND_PEER walk. Never our own address: a
                 // NAT'd node cannot be reached there.
                 auto relays = server.relayAddresses(); // this loop's own listen() result
-                dht.announce(topic, keyPair, relays); // topic record
+                nrelays = relays.length;
+                stored = dht.announce(topic, keyPair, relays); // topic record
             }
-            catch (Exception)
-            {
-            }
+            catch (Exception e)
+                failure = e.msg;
+            // Visible: every 10th round (5 min), and whenever it failed or landed nowhere or
+            // changed from landing nowhere — a node that degrades over hours must show it.
+            immutable bad = failure !is null || stored <= 0 || self <= 0;
+            if (round == 1 || round % 10 == 0 || bad || lastBad)
+                try
+                {
+                    immutable ms = (MonoTime.currTime - t0).total!"msecs";
+                    if (bad)
+                        logWarn("hyperswarm: announce #%s — self on %s node(s), topic on %s, %s relay(s), table %s, %s ms%s",
+                            round, self, stored, nrelays, dht.table.size, ms, failure is null ? "" : ": " ~ failure);
+                    else
+                        logInfo("hyperswarm: announce #%s — self on %s node(s), topic on %s, %s relay(s), table %s, %s ms",
+                            round, self, stored, nrelays, dht.table.size, ms);
+                }
+                catch (Exception)
+                {
+                }
+            lastBad = bad;
             for (int i = 0; i < ticks && !destroyed; i++)
                 try
                     sleep(100.msecs);

@@ -135,7 +135,8 @@ final class Dht
         // every unqueried node is farther than the k-th responder and nothing is
         // in flight. Serial with 2-3 s timeouts on the nodes that never answer, a
         // public-DHT walk took 6-13 s; the punch after it takes 2.
-        import vibe.core.core : runTask;
+        import vibe.core.task : InterruptException;
+import vibe.core.core : runTask;
         import vibe.core.sync : createManualEvent;
         enum alpha = 3;
         enum maxQueried = 80;
@@ -201,8 +202,21 @@ final class Dht
                     Reply rep;
                     try
                         rep = rpc.request(Address(n.host, 4, n.port), command, target[], value, null, internal, per);
+                    catch (InterruptException)
+                        return;   // the walk was cancelled: says nothing about the node
                     catch (Exception)
+                    {
+                        // gone (or not answering): out of the table, so its slot takes a live
+                        // node. A full bucket keeps what it has, and nothing else ever evicted —
+                        // after hours of uptime the table was mostly nodes that had left, and
+                        // every walk and announce started from them.
+                        try
+                            table.remove(n.id[]);
+                        catch (Exception)
+                        {
+                        }
                         return;
+                    }
                     try
                     {
                         table.add(n);
