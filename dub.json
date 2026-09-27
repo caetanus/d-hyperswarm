@@ -318,6 +318,20 @@
 				"source",
 				"interop/protomux-interop"
 			]
+		},
+		{
+			"name": "http-bridge",
+			"targetType": "executable",
+			"targetName": "http-bridge",
+			"mainSourceFile": "interop/http-bridge/app.d",
+			"sourcePaths": [
+				"source",
+				"interop/http-bridge"
+			],
+			"importPaths": [
+				"source",
+				"interop/http-bridge"
+			]
 		}
 	]
 }
