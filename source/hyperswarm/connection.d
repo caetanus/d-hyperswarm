@@ -296,13 +296,27 @@ final class Connection
 
         if (closed || stream is null)
             return "";
-        ulong[12] v;
+        ulong[16] v;
         hs_udx_stream_stats(stream, v.ptr);
         try
-            return format("mtu=%s(state %s) srtt=%sms rto=%sms cwnd=%s inflight=%sB outstanding=%s lost=%s retx=%s rtos=%s rwnd=%s rx=%s",
-                v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11]);
+            return format("mtu=%s(state %s) srtt=%sms rto=%sms cwnd=%s inflight=%sB outstanding=%s lost=%s retx=%s rtos=%s rwnd=%s rx-inorder=%s rx-pkts=%s rx-bytes=%s tx-pkts=%s sock-rx=%s",
+                v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11], v[12], v[13], v[14], v[15]);
         catch (Exception)
             return "";
+    }
+
+    /// Every udx packet this connection's stream has received so far (data, acks,
+    /// retransmits, in order or not): a link whose app messages are stuck behind one lost
+    /// packet is still alive while this grows. 0 once closed.
+    ulong packetsReceived() nothrow
+    {
+        import hyperswarm.udx.udx : hs_udx_stream_stats;
+
+        if (closed || stream is null)
+            return 0;
+        ulong[16] v;
+        hs_udx_stream_stats(stream, v.ptr);
+        return v[12];
     }
 
     /// Send encrypted application data to the peer.
