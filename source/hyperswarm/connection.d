@@ -112,6 +112,9 @@ final class Connection
     /// Where the peer is, for THIS connection (a peer can be reached at several —
     /// its LAN address and its punched WAN one — each its own connection).
     Address remoteAddress;
+    /// True on the side that dialed (the swarm's outbound connections): the dialer usually
+    /// speaks first, and an application that runs a different role per side needs to know.
+    bool isInitiator;
     // In-flight writes: request-block ptr -> [request block, payload], kept alive
     // until udx acks (hsConnAck), so a long-lived connection doesn't accumulate
     // every byte it ever sent.

@@ -444,6 +444,7 @@ final class Hyperswarm
                 conn.destroy();
                 return;
             }
+            conn.isInitiator = true;
             keep(hex, conn);
         }
         catch (Exception)
@@ -546,6 +547,7 @@ final class Hyperswarm
             conn.destroy(); // closed meanwhile, or an inbound over this path won the race
             return;
         }
+        conn.isInitiator = true;
         keep(hex, conn);
     }
 
