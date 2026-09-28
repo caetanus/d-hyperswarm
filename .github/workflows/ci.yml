@@ -1,0 +1,30 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # libsodium is the only system dependency; libudx is vendored and built by
+      # the ut config's preBuild (plain C, linker-isolated — see vendor/build-libudx.sh).
+      - name: System deps
+        run: sudo apt-get update && sudo apt-get install -y libsodium-dev
+
+      - name: Install LDC
+        uses: dlang-community/setup-dlang@v2
+        with:
+          compiler: ldc-latest
+
+      - name: Build library
+        run: dub build --compiler=ldc2
+
+      - name: Build + run unit tests
+        run: |
+          dub build -c ut --compiler=ldc2
+          ./bin/hyperswarm-test
