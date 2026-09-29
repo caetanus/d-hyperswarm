@@ -5,9 +5,9 @@
 # are -I only and compiled by the app at link, so no duplicate-module skew.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-LDC="$HOME/lab/android-d/ldc2-1.42.0-linux-x86_64/bin/ldc2"
-CONF="$HOME/lab/photo-wagon/mobile/toolchain/ldc2-android.conf"
-DUBP="$HOME/.dub/packages"
+LDC="${LDC:-$HOME/lab/android-d/ldc2-1.42.0-linux-x86_64/bin/ldc2}"
+CONF="${LDC_CONF:-$HOME/lab/photo-wagon/mobile/toolchain/ldc2-android.conf}"
+DUBP="${DUBP:-$HOME/.dub/packages}"
 # ARCH=arm64 (default) or x86_64 (Waydroid): picks the LDC target triple.
 ARCH="${ARCH:-arm64}"
 case "$ARCH" in
